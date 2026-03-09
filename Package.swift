@@ -8,11 +8,17 @@ let package = Package(
     ],
     products: [
         .library(name: "TinkerTownCore", targets: ["TinkerTownCore"]),
-        .executable(name: "tinkertown", targets: ["tinkertown"])
+        .executable(name: "tinkertown", targets: ["tinkertown"]),
+        .executable(name: "TinkerTownApp", targets: ["TinkerTownApp"])
     ],
     targets: [
         .target(name: "TinkerTownCore"),
         .executableTarget(name: "tinkertown", dependencies: ["TinkerTownCore"]),
+        .executableTarget(
+            name: "TinkerTownApp",
+            dependencies: ["TinkerTownCore"],
+            path: "Sources/TinkerTownApp"
+        ),
         .testTarget(name: "TinkerTownCoreTests", dependencies: ["TinkerTownCore"])
     ]
 )

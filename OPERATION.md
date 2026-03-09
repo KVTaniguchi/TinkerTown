@@ -1,5 +1,7 @@
 # TinkerTown Operation Guide
 
+This guide applies to both the CLI (`tinkertown`) and the macOS app (`TinkerTownApp`). The app triggers the same core orchestration flows (`run/status/logs/retry/cleanup/escalate`) without requiring terminal commands.
+
 ## Role model (single-process)
 
 When you run `tinkertown run "<request>"`, the **same process** acts as:

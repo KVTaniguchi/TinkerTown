@@ -1,6 +1,6 @@
 # TinkerTown
 
-Local multi-agent coding orchestrator for macOS/Apple Silicon, implemented as a Swift CLI. The same process acts as **Mayor** (planner), **Orchestrator**, and **Tinker** (worker); see [OPERATION.md](OPERATION.md) for role model and escalation.
+Local multi-agent coding orchestrator for macOS/Apple Silicon, implemented as a Swift core with both CLI and macOS app frontends. The same process acts as **Mayor** (planner), **Orchestrator**, and **Tinker** (worker); see [OPERATION.md](OPERATION.md) for role model and escalation.
 
 ## Prerequisites
 
@@ -14,6 +14,24 @@ Local multi-agent coding orchestrator for macOS/Apple Silicon, implemented as a 
 swift test
 swift build
 ```
+
+## macOS App (No Terminal Workflow)
+
+The `TinkerTownApp` target is a native SwiftUI macOS app that uses `TinkerTownCore` directly.
+
+- Open `Package.swift` in Xcode.
+- Select the `TinkerTownApp` scheme.
+- Run the app.
+
+Inside the app you can:
+
+- Choose a repository (no terminal required).
+- Run a request.
+- View run/task status and logs.
+- Retry failed tasks.
+- Cleanup run worktrees.
+- Log escalations.
+- See prerequisite/preflight checks (`git`, `swift`, repo state, optional `ollama`).
 
 ## CLI
 
