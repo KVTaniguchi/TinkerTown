@@ -1,0 +1,29 @@
+{
+  "use_ollama": true,
+  "models": {
+    "mayor": "qwen2.5-coder:32b",
+    "tinker": "qwen2.5-coder:7b"
+  },
+  "ollama": {
+    "num_parallel": 4,
+    "max_queue": 10,
+    "keep_alive": "24h",
+    "mayor_num_ctx": 32768,
+    "tinker_num_ctx": 8192
+  },
+  "orchestrator": {
+    "max_parallel_tasks": 4,
+    "max_retries_per_task": 3
+  },
+  "verification": {
+    "mode": "xcodebuild",
+    "command": "xcodebuild build -scheme ShopApp -configuration Debug"
+  },
+  "guardrails": {
+    "enforce_path_sandbox": true,
+    "blocked_commands": [
+      "git reset --hard",
+      "rm -rf /"
+    ]
+  }
+}
