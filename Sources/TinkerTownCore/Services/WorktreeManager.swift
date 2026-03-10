@@ -19,6 +19,25 @@ public struct WorktreeManager {
         guard fs.fileExists(path) else {
             throw NSError(domain: "WorktreeManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Worktree path missing after create"])
         }
+
+        // Validate that the new worktree HEAD matches the base branch SHA to guard against
+        // accidental divergence at creation time.
+        let baseSHAResult = try shell.run("git rev-parse \(baseBranch)", cwd: root)
+        let baseSHA = baseSHAResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        let worktreeSHAResult = try shell.run("git rev-parse HEAD", cwd: path)
+        let worktreeSHA = worktreeSHAResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !baseSHA.isEmpty, baseSHA == worktreeSHA else {
+            // If the fresh worktree somehow diverged from the base branch, clean up any
+            // TinkerTown worktrees so a subsequent run can start from a known-good state.
+            cleanupOrphaned(root: root)
+            throw NSError(
+                domain: "WorktreeManager",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Worktree HEAD does not match base branch SHA. Cleaned up TinkerTown worktrees; please retry the run."
+                ]
+            )
+        }
         return (worktreeRel, branch)
     }
 

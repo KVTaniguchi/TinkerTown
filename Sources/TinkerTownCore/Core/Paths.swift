@@ -5,12 +5,15 @@ public struct AppPaths {
     public let tinkerRoot: URL
     public let runsRoot: URL
     public let configFile: URL
+    /// Default path for the active Product Design Requirement (PDR). Required before a run can start.
+    public let pdrFile: URL
 
     public init(root: URL) {
         self.root = root
         tinkerRoot = root.appendingPathComponent(".tinkertown", isDirectory: true)
         runsRoot = tinkerRoot.appendingPathComponent("runs", isDirectory: true)
         configFile = tinkerRoot.appendingPathComponent("config.json")
+        pdrFile = tinkerRoot.appendingPathComponent("pdr.json")
     }
 
     public func runDir(_ runID: String) -> URL {

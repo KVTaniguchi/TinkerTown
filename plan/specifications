@@ -1,0 +1,479 @@
+L1:# TinkerTown Executable Engineering Specification (v1)
+L2:
+L3:## 0. Purpose
+L4:Build a fully local, Apple-Silicon-optimized, **fire-and-forget** multi-agent coding orchestrator that:
+L5:
+L6:1. requires a Product Design Requirement (PDR) and accepts an optional high-level request, then owns the rest of the lifecycle,
+L7:2. plans tasks from the PDR and request without further prompting,
+L8:3. executes independent tasks in parallel isolated worktrees using local models (via Ollama),
+L9:4. validates each result with deterministic local build checks,
+L10:5. decides merge/reject according to policy with no human in the loop during normal operation,
+L11:6. interrupts the user only for unrecoverable escalations or final merge review (per run policy),
+L12:7. leaves a reproducible audit trail.
+L13:
+L14:Once a run is created, the orchestrator is responsible for planning, execution, verification, and merge decisions end‑to‑end. Human input is treated as an exception (escalation or explicit override), not a requirement for steady-state progress.
+L15:
+L16:This document is implementation-oriented and defines contracts, states, schemas, failure classes, safety rules, and acceptance criteria for that autonomous “fire and forget” loop.
+L17:
+L18:## 1. Scope
+L19:
+L20:### 1.1 In Scope
+L21:1. Offline orchestration using local Ollama models.
+L22:2. Worktree-based parallel task execution.
+L23:3. Build-only verification loop (`swift build` or `xcodebuild build`) during fast iteration.
+L24:4. Structured event logging and task run records.
+L25:5. Deterministic retry/reassignment behavior.
+L26:
+L27:### 1.2 Out of Scope (v1)
+L28:1. Distributed multi-host scheduling.
+L29:2. Full test suite orchestration as a hard gate.
+L30:3. Automatic semantic conflict resolution.
+L31:4. Non-git source control support.
+L32:
+L33:## 2. Runtime Environment
+L34:1. Hardware target: Apple Silicon (baseline assumption: M4-class machine with high unified memory).
+L35:2. OS: macOS with Xcode command line tools installed.
+L36:3. Tooling:
+L37:   1. `git`
+L38:   2. `swift` and/or `xcodebuild`
+L39:   3. `ollama`
+L40:   4. Optional formatter/parser tools: `xcbeautify`, `sourcekitten`
+L41:
+L42:## 3. System Components
+L43:
+L44:### 3.1 Mayor (Planner/Orchestrator)
+L45:The Mayor is an autonomous local agent (typically backed by a Qwen 2.5 Coder model via Ollama) that owns the run-level plan and safety envelope once a **Product Design Requirement (PDR)** and optional request are provided.
+L46:
+L47:**Inputs (both required for planning):**
+L48:1. **PDR** — A Product Design Requirement document (see §5.5) that defines what the project or run is building. No work may start until a valid PDR is available.
+L49:2. **Request** (optional) — A short user request (e.g. “add checkout banner”) that may refine or scope the current run within the PDR.
+L50:
+L51:**Responsibilities:**
+L52:1. Consume the PDR (and optional request) and produce a task graph without further prompting.
+L53:2. Assign runnable tasks to workers using only local context and configured models.
+L54:3. Review patch metadata and inspector evidence to decide merge/reject/retry.
+L55:4. Enforce global guardrails, concurrency limits, and escalation policy (when to interrupt the user).
+L56:
+L57:### 3.2 Tinker (Worker)
+L58:The Tinker is an autonomous local coding agent (also typically Qwen 2.5 Coder via Ollama) that operates inside an isolated worktree for a single task.
+L59:
+L60:Responsibilities:
+L61:1. Operate only inside the assigned worktree path with sandboxed filesystem access.
+L62:2. Apply code changes for one task based on the Mayor’s plan and local repository state.
+L63:3. Run the inspector loop up to the configured retry budget without human assistance.
+L64:4. Return a structured result (success/failure plus evidence) suitable for the Mayor’s fully automated merge decision.
+L65:
+L66:### 3.3 Inspector (Verifier)
+L67:Responsibilities:
+L68:1. Execute configured build command.
+L69:2. Capture full logs and parsed diagnostics.
+L70:3. Classify result using error taxonomy.
+L71:4. Return pass/fail and machine-readable diagnostics.
+L72:
+L73:### 3.4 Indexer (Codebase Map)
+L74:Responsibilities:
+L75:1. Build and refresh `TinkerMap.json`.
+L76:2. Provide symbol-level context routing to mayor/tinkers.
+L77:3. Emit a version/hash for reproducibility.
+L78:
+L79:## 4. State Machine
+L80:
+L81:### 4.1 Run State Machine
+L82:States:
+L83:1. `RUN_CREATED`
+L84:2. `PLANNING`
+L85:3. `TASKS_READY`
+L86:4. `EXECUTING`
+L87:5. `MERGING`
+L88:6. `COMPLETED`
+L89:7. `FAILED`
+L90:8. `CANCELLED`
+L91:
+L92:Transitions:
+L93:1. `RUN_CREATED -> PLANNING` when a valid PDR is available and request validation succeeds (see §5.5 and Run creation gating).
+L94:2. `PLANNING -> TASKS_READY` when task graph is emitted.
+L95:3. `TASKS_READY -> EXECUTING` when at least one task dispatched.
+L96:4. `EXECUTING -> MERGING` when merge candidates exist.
+L97:5. `MERGING -> EXECUTING` when additional pending tasks remain.
+L98:6. `MERGING -> COMPLETED` when all tasks terminal and required merges done.
+L99:7. `* -> FAILED` on unrecoverable system error.
+L100:8. `* -> CANCELLED` on user/system cancel.
+L101:
+L102:### 4.2 Task State Machine
+L103:States:
+L104:1. `TASK_CREATED`
+L105:2. `WORKTREE_READY`
+L106:3. `PROMPTED`
+L107:4. `PATCH_APPLIED`
+L108:5. `VERIFYING`
+L109:6. `VERIFY_FAILED_RETRYABLE`
+L110:7. `VERIFY_PASSED`
+L111:8. `MERGE_READY`
+L112:9. `MERGED`
+L113:10. `REJECTED`
+L114:11. `FAILED`
+L115:12. `CLEANED`
+L116:
+L117:Transitions:
+L118:1. `TASK_CREATED -> WORKTREE_READY` after successful worktree creation.
+L119:2. `WORKTREE_READY -> PROMPTED` after worker receives context.
+L120:3. `PROMPTED -> PATCH_APPLIED` when worker outputs patch and patch applies.
+L121:4. `PATCH_APPLIED -> VERIFYING` when inspector starts build.
+L122:5. `VERIFYING -> VERIFY_FAILED_RETRYABLE` for retryable failures.
+L123:6. `VERIFY_FAILED_RETRYABLE -> PROMPTED` while retry_count < max_retries.
+L124:7. `VERIFYING -> VERIFY_PASSED` on exit code `0`.
+L125:8. `VERIFY_PASSED -> MERGE_READY` when diff and evidence attached.
+L126:9. `MERGE_READY -> MERGED` on clean merge.
+L127:10. `MERGE_READY -> REJECTED` on mayor policy rejection.
+L128:11. `ANY -> FAILED` on non-retryable error.
+L129:12. `MERGED|REJECTED|FAILED -> CLEANED` after teardown attempt.
+L130:
+L131:## 5. Core Data Contracts (JSON Schemas)
+L132:
+L133:### 5.1 `RunRecord`
+L134:Run records MUST include `pdr_id` (see §5.5) to link the run to the PDR used for planning.
+L135:```json
+L136:{
+L137:  "run_id": "run_20260308_001",
+L138:  "created_at": "2026-03-08T21:00:00Z",
+L139:  "state": "EXECUTING",
+L140:  "request": "Add checkout discount banner and tests",
+L141:  "base_branch": "main",
+L142:  "head_branch": null,
+L143:  "config": {
+L144:    "max_parallel_tasks": 4,
+L145:    "max_retries_per_task": 3
+L146:  },
+L147:  "task_ids": ["task_001", "task_002"],
+L148:  "pdr_id": "pdr_001",
+L149:  "metrics": {
+L150:    "tasks_total": 2,
+L151:    "tasks_merged": 1,
+L152:    "tasks_failed": 0,
+L153:    "total_retries": 1
+L154:  }
+L155:}
+L156:```
+L157:
+L158:### 5.2 `TaskRecord`
+L159:```json
+L160:{
+L161:  "task_id": "task_001",
+L162:  "run_id": "run_20260308_001",
+L163:  "title": "Implement banner component",
+L164:  "state": "MERGE_READY",
+L165:  "priority": 2,
+L166:  "depends_on": [],
+L167:  "assigned_model": "qwen2.5-coder:7b",
+L168:  "worktree_path": ".tinkertown/task-001",
+L169:  "branch": "tinkertown/task-001",
+L170:  "target_files": ["Shop/BannerView.swift"],
+L171:  "retry_count": 1,
+L172:  "max_retries": 3,
+L173:  "verify": {
+L174:    "command": "swift build",
+L175:    "exit_code": 0,
+L176:    "diagnostics": []
+L177:  },
+L178:  "result": {
+L179:    "diff_stats": {"files": 1, "insertions": 42, "deletions": 3},
+L180:    "merge_sha": null
+L181:  }
+L182:}
+L183:```
+L184:
+L185:### 5.3 `DiagnosticRecord`
+L186:```json
+L187:{
+L188:  "task_id": "task_001",
+L189:  "timestamp": "2026-03-08T21:03:40Z",
+L190:  "tool": "xcodebuild",
+L191:  "severity": "error",
+L192:  "code": "SWIFT_TYPECHECK",
+L193:  "file": "Shop/BannerView.swift",
+L194:  "line": 87,
+L195:  "column": 19,
+L196:  "message": "Cannot convert value of type 'Int' to expected argument type 'String'"
+L197:}
+L198:```
+L199:
+L200:### 5.4 `TinkerMap.json`
+L201:```json
+L202:{
+L203:  "version": "1",
+L204:  "generated_at": "2026-03-08T21:00:00Z",
+L205:  "source_revision": "git_sha_here",
+L206:  "modules": [
+L207:    {
+L208:      "name": "Shop",
+L209:      "files": [
+L210:        {
+L211:          "path": "Shop/BannerView.swift",
+L212:          "symbols": [
+L213:            {"name": "BannerView", "kind": "struct", "signature": "struct BannerView: View"},
+L214:            {"name": "body", "kind": "var", "signature": "var body: some View"}
+L215:          ]
+L216:        }
+L217:      ]
+218:    }
+219:  ]
+220:}
+221:```
+222:
+223:### 5.5 Product Design Requirement (PDR)
+224:A **Product Design Requirement (PDR)** is the canonical “what we are building” document for a project or run. The Mayor uses it to produce a task list and to keep delegation consistent. No run may transition to `PLANNING` until a valid PDR is available.
+225:
+226:**Schema `PDRRecord` (JSON):**
+227:```json
+228:{
+229:  "pdr_id": "pdr_001",
+230:  "version": 1,
+231:  "created_at": "2026-03-08T21:00:00Z",
+232:  "updated_at": "2026-03-08T21:00:00Z",
+233:  "title": "Checkout discount banner",
+234:  "summary": "Add a dismissible banner on the checkout screen that shows current discount and CTA.",
+235:  "scope": "Shop app checkout flow; no backend changes.",
+236:  "acceptance_criteria": [
+237:    "Banner visible on checkout screen when discount applies",
+238:    "Banner dismissible; state persisted for session",
+239:    "Unit tests for banner visibility and dismiss logic"
+240:  ],
+241:  "constraints": "SwiftUI only; match existing Shop design system.",
+242:  "out_of_scope": "Backend discount API; analytics."
+243:}
+244:```
+245:
+246:- **pdr_id**: Unique identifier (e.g. UUID or slug). Used in `RunRecord.pdr_id` for audit.
+247:- **version**: Schema version for migrations.
+248:- **title**, **summary**, **scope**: Human-readable product context.
+249:- **acceptance_criteria**: Array of strings; Mayor and verification can reference these.
+250:- **constraints**, **out_of_scope**: Optional; reduce ambiguity for the Mayor and workers.
+251:
+252:**Storage:**
+253:- **Default (single active PDR per repo):** `.tinkertown/pdr.json`. The app/CLI treats this as the active PDR. If missing or invalid, run creation is blocked.
+254:- **Override by path:** CLI/app may accept `--pdr <path>` or equivalent so the user can point to another file (e.g. `docs/pdr-checkout-banner.json`). That path is resolved at run creation and the resolved PDR is used for that run.
+255:- **No automatic creation:** The Mayor does not create the PDR. The user (or an external process) must provide or create it before starting work.
+256:
+257:**Run creation gating:**
+258:1. Before creating a run or calling the Mayor to plan, the system MUST resolve the active PDR (from `.tinkertown/pdr.json` or from the provided path).
+259:2. If no PDR is found or the file is invalid (e.g. missing `pdr_id` or `title`), run creation MUST fail with a clear error (e.g. “Product Design Requirement required. Add `.tinkertown/pdr.json` or pass --pdr <path>.”).
+260:3. On success, `RunRecord` MUST store `pdr_id` (and optionally the resolved path) for audit and status.
+261:
+262:**How the Mayor uses the PDR:**
+263:- **Input to planning:** Mayor’s `plan` (or equivalent) receives the PDR plus the optional request string. It produces a task graph (list of `PlannedTask`) that satisfies the PDR and the request.
+264:- **Context for workers:** The PDR (or a summary) may be included in the context passed to Tinker for each task so that edits stay aligned with acceptance criteria and constraints.
+265:- **No editing:** The Mayor does not modify the PDR; it only reads it.
+266:
+267:## 6. Task Graph and Scheduling Rules
+268:1. A task is runnable only if all `depends_on` tasks are `MERGED`.
+269:2. Scheduler must not dispatch two tasks that both edit the same file unless explicitly marked `coeditable=true`.
+270:3. Default `max_parallel_tasks` equals `min(OLLAMA_NUM_PARALLEL, 4)`.
+271:4. Starvation prevention: oldest runnable task first, then priority.
+272:5. Reassignment rule: after task `FAILED`, mayor may create a replacement task only once (`replacement_depth <= 1` in v1).
+273:
+274:## 7. Worktree Lifecycle Contract
+275:1. Create:
+276:   1. `git worktree add .tinkertown/task-[id] -b tinkertown/task-[id] main`
+277:2. Validate:
+278:   1. Worktree path exists and branch points to expected base SHA.
+279:3. Use:
+280:   1. All worker commands run with cwd set to worktree path.
+281:4. Merge:
+282:   1. Fast-forward or regular merge only; no rebase in v1 automation.
+283:5. Teardown:
+284:   1. `git worktree remove .tinkertown/task-[id] --force`
+285:   2. `git branch -D tinkertown/task-[id]` after merge/reject/fail.
+286:
+287:## 8. Safety Guardrails
+288:
+289:### 8.1 File-System and Command Guardrails
+290:1. Worker must be denied access outside assigned worktree root.
+291:2. Blocklist destructive commands by default in worker stage:
+292:   1. `git reset --hard`
+293:   2. `rm -rf /`
+294:   3. any command targeting parent paths outside worktree.
+295:3. Allowed git cleanup for worker:
+296:   1. `git restore --source=HEAD --worktree --staged .` within worktree only.
+297:
+298:### 8.2 Merge Guardrails
+299:1. Reject merge if diff touches files outside task `target_files` unless mayor explicitly expands scope.
+300:2. Reject merge if build evidence is stale (older than last commit in worktree).
+301:3. Reject merge if unresolved conflict markers exist in patched files.
+302:
+303:### 8.3 Data Guardrails
+304:1. Never store secrets in logs/events.
+305:2. Redact values matching configured secret patterns before persistence.
+306:
+307:## 9. Error Taxonomy and Retry Policy
+308:
+309:### 9.1 Error Classes
+310:1. `E_BUILD_COMPILE`: compile/build failure.
+311:2. `E_PATCH_APPLY`: patch failed to apply.
+312:3. `E_MERGE_CONFLICT`: merge conflict.
+313:4. `E_TOOL_UNAVAILABLE`: missing required binary/tool.
+314:5. `E_MODEL_TIMEOUT`: LLM response timeout.
+315:6. `E_GUARDRAIL_VIOLATION`: blocked command/path access violation.
+316:7. `E_INTERNAL`: unhandled orchestrator exception.
+317:
+318:### 9.2 Retryability Matrix
+319:1. Retryable:
+320:   1. `E_BUILD_COMPILE`
+321:   2. `E_PATCH_APPLY`
+322:   3. `E_MODEL_TIMEOUT`
+323:2. Non-retryable (task -> `FAILED`):
+324:   1. `E_GUARDRAIL_VIOLATION`
+325:   2. `E_TOOL_UNAVAILABLE`
+326:3. Conditionally retryable:
+327:   1. `E_MERGE_CONFLICT` -> retry once with fresh base and regenerated patch.
+328:
+329:### 9.3 Retry Limits
+330:1. `max_retries_per_task = 3`.
+331:2. Backoff schedule: 0s, 3s, 10s.
+332:3. Store per-attempt evidence: prompt hash, patch hash, build command, parsed diagnostics.
+333:
+334:## 10. Verification Contract (Inspector)
+335:1. Build command is selected by repo config:
+336:   1. SPM module: `swift build`
+337:   2. Xcode app: `xcodebuild build -scheme <scheme> -configuration Debug`
+338:2. Pass condition: exit code `0`.
+339:3. Parse diagnostics from structured outputs when available; regex fallback allowed.
+340:4. Preserve raw log file per attempt at:
+341:   1. `.tinkertown/runs/<run_id>/tasks/<task_id>/attempt_<n>.log`
+342:5. Emit `DiagnosticRecord[]` even when empty.
+343:
+344:## 11. Observability and Audit
+345:
+346:### 11.1 Event Log
+347:Append-only NDJSON:
+348:`.tinkertown/runs/<run_id>/events.ndjson`
+349:
+350:Event example:
+351:```json
+352:{
+353:  "ts": "2026-03-08T21:05:20Z",
+354:  "run_id": "run_20260308_001",
+355:  "task_id": "task_001",
+356:  "type": "TASK_STATE_CHANGED",
+357:  "from": "VERIFYING",
+358:  "to": "VERIFY_PASSED",
+359:  "meta": {"attempt": 2}
+360:}
+361:```
+362:
+363:### 11.2 Required Metrics
+364:1. `run_duration_seconds`
+365:2. `task_cycle_time_seconds`
+366:3. `retry_rate`
+367:4. `merge_success_rate`
+368:5. `conflict_rate`
+369:6. `median_build_time_seconds`
+370:
+371:### 11.3 Status Agent (v1)
+372:1. A read-only Status Agent MUST consume `RunRecord`, `TaskRecord[]`, and the metrics in 11.2 to produce a concise, human-readable summary of run progress.
+373:2. The Status Agent MUST NOT issue new plans or patches; it only reflects persisted state (no feedback loop into the Mayor/Tinker).
+374:3. The CLI `tinkertown summary <run_id>` MUST be backed by the Status Agent and print:
+375:   1. Overall metrics for the run.
+376:   2. One checklist-style line per task (state, retries, and title).
+377:
+378:## 12. Configuration Spec
+379:Primary config file:
+380:`.tinkertown/config.json`
+381:
+382:```json
+383:{
+384:  "models": {
+385:    "mayor": "qwen2.5-coder:32b",
+386:    "tinker": "qwen2.5-coder:7b"
+387:  },
+388:  "ollama": {
+389:    "num_parallel": 4,
+390:    "max_queue": 10,
+391:    "keep_alive": "24h",
+392:    "mayor_num_ctx": 32768,
+393:    "tinker_num_ctx": 8192
+394:  },
+395:  "orchestrator": {
+396:    "max_parallel_tasks": 4,
+397:    "max_retries_per_task": 3
+398:  },
+399:  "verification": {
+400:    "mode": "spm",
+401:    "command": "swift build"
+402:  },
+403:  "guardrails": {
+404:    "enforce_path_sandbox": true,
+405:    "blocked_commands": ["git reset --hard", "rm -rf /"]
+406:  }
+407:}
+408:```
+409:
+410:## 13. CLI/API Surface (v1)
+411:
+412:### 13.1 CLI Commands
+413:1. `tinkertown run "<request>"` — Requires an active PDR (see §5.5). Uses `.tinkertown/pdr.json` unless `--pdr <path>` is given. Fails with a clear error if no valid PDR is found.
+414:2. `tinkertown status <run_id>`
+415:3. `tinkertown summary <run_id>`
+416:4. `tinkertown logs <run_id> [--task <task_id>]`
+417:5. `tinkertown retry <run_id> <task_id>`
+418:6. `tinkertown cleanup <run_id>`
+419:
+420:### 13.2 Local API (optional)
+421:1. `POST /runs`
+422:2. `GET /runs/{id}`
+423:3. `GET /runs/{id}/tasks`
+424:4. `POST /runs/{id}/cancel`
+425:
+426:## 14. Acceptance Test Plan
+427:
+428:### 14.1 Happy Path
+429:1. Input request decomposes into at least 2 independent tasks.
+430:2. Tasks run in parallel in separate worktrees.
+431:3. Each task passes build.
+432:4. Mayor merges all without conflicts.
+433:5. Run ends in `COMPLETED`.
+434:
+435:### 14.2 Retry Path
+436:1. Inject compile error in worker patch.
+437:2. Inspector returns `E_BUILD_COMPILE`.
+438:3. Worker retries and fixes issue before max retry.
+439:4. Final merge succeeds.
+440:
+441:### 14.3 Conflict Path
+442:1. Two tasks target same file.
+443:2. One merge succeeds first.
+444:3. Second hits `E_MERGE_CONFLICT`.
+445:4. System performs one fresh-base retry.
+446:5. If still conflicting, task ends `FAILED` and run remains consistent.
+447:
+448:### 14.4 Guardrail Path
+449:1. Worker attempts blocked command.
+450:2. Inspector/orchestrator emits `E_GUARDRAIL_VIOLATION`.
+451:3. Task terminates immediately.
+452:4. No destructive repo change occurs.
+453:
+454:### 14.5 Crash Recovery Path
+455:1. Kill orchestrator mid-run.
+456:2. Restart process.
+457:3. Run resumes from persisted `RunRecord` and `TaskRecord` states.
+458:4. No orphaned worktrees after cleanup.
+459:
+460:## 15. Definition of Done (v1)
+461:1. All acceptance tests above pass in a local sample repo.
+462:2. Event logs and task records are produced for every run.
+463:3. Guardrails enforce path and command restrictions.
+464:4. Retry behavior matches matrix and limits.
+465:5. Merge decisions are reproducible from stored evidence.
+466:
+467:## 16. Implementation Order
+468:1. Persisted schemas + state machine engine.
+469:2. Worktree manager and cleanup guarantees.
+470:3. Inspector with structured diagnostics + log persistence.
+471:4. Scheduler with dependency and file-lock constraints.
+472:5. Mayor/tinker prompting adapters and merge gate.
+473:6. Metrics and status CLI.
+474:7. PDR as required input: PDR schema, storage (`.tinkertown/pdr.json` / `--pdr`), run-creation gating, Mayor consumes PDR + request (see §5.5).
+475:
+476:## 17. Open Decisions (Must Resolve Before v1.1)
+477:1. Whether to require tests on merge for specific directories (e.g., checkout/payment paths).
+478:2. Whether to allow automatic scope expansion for cross-file refactors.
+479:3. Whether to support model fallback chain when mayor model is unavailable.

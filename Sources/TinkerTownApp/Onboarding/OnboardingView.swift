@@ -372,6 +372,7 @@ private struct DeviceCheckStepView: View {
                 .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: 400, alignment: .leading)
+        .onAppear { viewModel.runDeviceCheck() }
     }
 }
 

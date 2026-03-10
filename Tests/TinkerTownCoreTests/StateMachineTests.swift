@@ -12,6 +12,10 @@ struct StateMachineTests {
         }
     }
 
+    @Test func allowsFailedToExecutingForResume() throws {
+        try StateMachine.validateRunTransition(from: .failed, to: .executing)
+    }
+
     @Test func allowsRetryTaskTransition() throws {
         try StateMachine.validateTaskTransition(from: .verifyFailedRetryable, to: .prompted)
     }

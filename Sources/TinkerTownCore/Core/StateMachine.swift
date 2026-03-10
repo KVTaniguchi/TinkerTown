@@ -18,11 +18,12 @@ public struct StateMachine {
     public static let runTransitions: [RunState: Set<RunState>] = [
         .runCreated: [.planning, .failed, .cancelled],
         .planning: [.tasksReady, .failed, .cancelled],
-        .tasksReady: [.executing, .failed, .cancelled],
+        .tasksReady: [.pendingApproval, .executing, .failed, .cancelled],
+        .pendingApproval: [.executing, .failed, .cancelled],
         .executing: [.merging, .failed, .cancelled],
         .merging: [.executing, .completed, .failed, .cancelled],
         .completed: [],
-        .failed: [],
+        .failed: [.executing],
         .cancelled: []
     ]
 

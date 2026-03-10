@@ -4,12 +4,15 @@ public struct Scheduler {
     public init() {}
 
     public func runnableTasks(all tasks: [TaskRecord], maxParallel: Int) -> [TaskRecord] {
-        let merged = Set(tasks.filter { $0.state == .merged }.map(\.taskID))
+        let mergedTasks = tasks.filter { $0.state == .merged }
+        let mergedIDs = Set(mergedTasks.map(\.taskID))
+        let mergedTitles = Set(mergedTasks.map(\.title))
+        let satisfiedDeps = mergedIDs.union(mergedTitles)
         let active = Set(tasks.filter { [.worktreeReady, .prompted, .patchApplied, .verifying, .verifyFailedRetryable].contains($0.state) }.map(\.taskID))
 
         let candidates = tasks.filter { task in
             guard task.state == .taskCreated || task.state == .verifyFailedRetryable else { return false }
-            guard task.dependsOn.allSatisfy({ merged.contains($0) }) else { return false }
+            guard task.dependsOn.allSatisfy({ satisfiedDeps.contains($0) }) else { return false }
             guard task.replacementDepth <= 1 else { return false }
             guard !active.contains(task.taskID) else { return false }
             return true

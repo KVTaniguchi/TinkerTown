@@ -14,7 +14,7 @@ public struct AppConfig: Codable, Equatable, Sendable {
         models: ModelConfig(mayor: "qwen2.5-coder:32b", tinker: "qwen2.5-coder:7b"),
         ollama: OllamaConfig(numParallel: 4, maxQueue: 10, keepAlive: "24h", mayorNumCtx: 32768, tinkerNumCtx: 8192),
         orchestrator: OrchestratorConfig(maxParallelTasks: 4, maxRetriesPerTask: 3),
-        verification: VerificationConfig(mode: "xcodebuild", command: "xcodebuild build -scheme ShopApp -configuration Debug"),
+        verification: VerificationConfig(mode: "spm", command: "swift build"),
         guardrails: GuardrailConfig(enforcePathSandbox: true, blockedCommands: ["git reset --hard", "rm -rf /"])
     )
 

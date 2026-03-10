@@ -54,17 +54,14 @@ public struct HealthCheckRunner {
             }
         }
 
-        // 3. Repo preflight
+        // 3. Repo preflight (auto-initialize when possible)
         if let repoURL {
             do {
-                let inside = try shell.run("git rev-parse --is-inside-work-tree", cwd: repoURL)
-                if inside.exitCode == 0 && inside.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "true" {
-                    results.append(HealthCheckResult(checkName: "Repo preflight", status: .pass, details: "Repository is a valid git worktree."))
-                } else {
-                    results.append(HealthCheckResult(checkName: "Repo preflight", status: .fail, details: "Selected path is not a git repository.", remediation: "Choose a repository with a .git folder and a main branch."))
-                }
+                let initializer = GitRepositoryInitializer(shell: shell)
+                _ = try initializer.ensureRepository(at: repoURL)
+                results.append(HealthCheckResult(checkName: "Repo preflight", status: .pass, details: "Repository is a valid git worktree."))
             } catch {
-                results.append(HealthCheckResult(checkName: "Repo preflight", status: .fail, details: "Failed to run repo preflight.", remediation: error.localizedDescription))
+                results.append(HealthCheckResult(checkName: "Repo preflight", status: .fail, details: "Selected path is not a git repository.", remediation: error.localizedDescription))
             }
         } else {
             results.append(HealthCheckResult(checkName: "Repo preflight", status: .warn, details: "No repository selected during onboarding.", remediation: "Pick a repository in the main app before running tasks."))

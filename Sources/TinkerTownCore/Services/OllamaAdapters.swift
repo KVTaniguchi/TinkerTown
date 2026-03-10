@@ -1,5 +1,14 @@
 import Foundation
 
+/// Thrown when the Tinker was asked to implement code but the model did not output an applicable patch.
+public struct TinkerError: Error, LocalizedError {
+    public let taskTitle: String
+    public let targetFiles: [String]
+    public var errorDescription: String? {
+        "Model did not produce a valid patch for task \"\(taskTitle)\" (targets: \(targetFiles.joined(separator: ", "))). The agent must output a unified diff to implement application code."
+    }
+}
+
 // MARK: - Ollama Mayor Adapter
 
 public struct OllamaMayorAdapter: MayorAdapting {
@@ -15,14 +24,38 @@ public struct OllamaMayorAdapter: MayorAdapting {
         self.fallback = fallback
     }
 
-    public func plan(request: String) -> [PlannedTask] {
+    public func plan(pdr: PDRRecord, request: String) -> [PlannedTask] {
         let system = """
-        You are a task planner. Given a user request, output a JSON array of tasks. Each task must have: "title" (string), "priority" (1-3, 1 highest), "depends_on" (array of task titles or empty), "target_files" (array of file paths, use placeholder like "tinkertown-task-notes.md" if unknown). Output only valid JSON, no markdown or explanation.
+        You are a task planner for a multi-component software system. The goal is to produce tasks that result in real application code being built—not documentation.
+
+        You are given a Product Design Requirement (PDR) and an optional user request. Use the PDR for scope and acceptance criteria; use the request to focus the current run.
+        Output a JSON array of tasks. Each task must have:
+        - "title" (string)
+        - "priority" (1-3, 1 highest)
+        - "depends_on" (array of task titles or empty)
+        - "target_files" (array of file paths that the worker will edit or create)
+        Optional fields (strongly recommended):
+        - "component_kind" (string, e.g. "backend_api", "web_app", "ios_app")
+        - "component_id" (string shared by tasks in the same component)
+        - "verification_command" (string, e.g. "npm test", "swift build", "true")
+
+        target_files: Use real source/config paths the implementation will touch. Examples: "backend/server.js", "package.json", "frontend/src/App.jsx", "api/task-schema.json", "db/schema.sql". Only use "tinkertown-task-notes.md" for meta or documentation-only tasks. Prefer concrete paths (e.g. server.js, package.json, src/App.jsx) so the coding agent writes application code, not notes.
+
+        When the user describes multiple components (backend, frontend, etc.), create at least one task per component, set component_kind and component_id, and use depends_on so dependencies are ordered. Ensure target_files point at the actual files that implement the feature.
+
+        Output only valid JSON, no markdown or explanation.
         """
-        let prompt = "User request: \(request)\n\nJSON array of tasks:"
+        let prompt = """
+        PDR context:
+        \(pdr.contextSummary)
+
+        User request: \(request.isEmpty ? pdr.title : request)
+
+        JSON array of tasks:
+        """
         guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system),
               let tasks = parsePlannedTasks(from: response) else {
-            return fallback.plan(request: request)
+            return fallback.plan(pdr: pdr, request: request)
         }
         return tasks
     }
@@ -39,11 +72,17 @@ public struct OllamaMayorAdapter: MayorAdapting {
             let priority = (item["priority"] as? Int).map { min(3, max(1, $0)) } ?? 1
             let dependsOn = (item["depends_on"] as? [String]) ?? []
             let targetFiles = (item["target_files"] as? [String]) ?? ["tinkertown-task-notes.md"]
+            let componentKind = item["component_kind"] as? String
+            let componentId = item["component_id"] as? String
+            let verificationCommand = item["verification_command"] as? String
             result.append(PlannedTask(
                 title: title,
                 priority: priority,
                 dependsOn: dependsOn,
-                targetFiles: targetFiles.isEmpty ? ["tinkertown-task-notes.md"] : targetFiles
+                targetFiles: targetFiles.isEmpty ? ["tinkertown-task-notes.md"] : targetFiles,
+                componentKind: componentKind,
+                componentId: componentId,
+                verificationCommand: verificationCommand
             ))
         }
         return result.isEmpty ? nil : result
@@ -78,28 +117,89 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
 
     public func apply(task: TaskRecord, context: String, worktree: URL) throws -> String {
         let system = """
-        You are a coding assistant. Apply the requested change. If you can output a unified diff (patch) that applies to the given files, output ONLY the diff with no explanation, starting with "---" and using a/ and b/ paths. Otherwise output a single line: FALLBACK
+        You are a software engineer implementing application code. Your job is to write or edit source files (backend, frontend, config, tests)—not documentation or notes.
+
+        You must respond with exactly one of:
+        1. A unified diff (patch) that applies with `git apply`. Output ONLY the diff: start with a line "--- a/<path>" or "--- /dev/null", then "+++ b/<path>", then hunk headers "@@ ... @@". Use paths relative to the repo root (e.g. a/server.js b/server.js). For NEW files use "--- /dev/null" and "+++ b/path/to/newfile". No explanation, no markdown, no code fences—just the raw diff.
+        2. Or one line: EXPLAIN: <short reason> only if the task is impossible (e.g. missing info).
+
+        You are building a real application. Implement the requested change in code. Do not write to tinkertown-task-notes.md or other docs as the deliverable; produce the actual source/config/test changes as a unified diff.
         """
         let fileList = task.targetFiles.joined(separator: ", ")
+        // Best-effort context: read contents of small target files.
+        var fileSnippets: [String] = []
+        for path in task.targetFiles {
+            let url = worktree.appendingPathComponent(path)
+            if let data = try? Data(contentsOf: url),
+               data.count < 128_000, // ~128 KB per file
+               let text = String(data: data, encoding: .utf8) {
+                fileSnippets.append("FILE: \(path)\n```\n\(text)\n```")
+            }
+        }
+        let contextFiles = fileSnippets.joined(separator: "\n\n")
         let prompt = """
+        Implement this task by changing the target files. Output only a unified diff (no prose, no markdown).
+
         Task: \(task.title)
         Context: \(context)
         Target files: \(fileList)
-        Produce a unified diff for the changes, or FALLBACK.
+        Current file contents (if present):
+        \(contextFiles.isEmpty ? "(files may not exist yet; use --- /dev/null and +++ b/<path> for new files)" : contextFiles)
+
+        Output only the unified diff, or EXPLAIN: <reason> if you cannot implement it.
         """
         guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system),
-              let patch = extractPatch(response),
-              (try? applyPatch(patch, worktree: worktree)) == true else {
-            return try fallback.apply(task: task, context: context, worktree: worktree)
+              let resultMessage = try handleResponse(response, worktree: worktree) else {
+            let isNotesOnly = task.targetFiles.allSatisfy { $0 == "tinkertown-task-notes.md" }
+            if isNotesOnly {
+                return try fallback.apply(task: task, context: context, worktree: worktree)
+            }
+            throw TinkerError(taskTitle: task.title, targetFiles: task.targetFiles)
         }
-        return "Applied patch from Ollama (\(patch.count) bytes)"
+        return resultMessage
     }
 
-    private func extractPatch(_ text: String) -> String? {
+    private func handleResponse(_ text: String, worktree: URL) throws -> String? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.uppercased().hasPrefix("FALLBACK") { return nil }
-        if trimmed.contains("---") && (trimmed.contains("+++") || trimmed.contains("@@")) {
-            return trimmed
+        if trimmed.uppercased().hasPrefix("EXPLAIN:") {
+            return String(trimmed.dropFirst("EXPLAIN:".count)).trimmingCharacters(in: .whitespaces)
+        }
+        let patch = extractPatch(from: trimmed)
+        if let patch, patch.contains("---"), patch.contains("@@") {
+            if try applyPatch(patch, worktree: worktree) {
+                return "Applied patch from Ollama (\(patch.count) characters)."
+            } else {
+                return "EXPLAIN: Model produced a patch but it failed to apply with git. Check for conflicts or invalid paths."
+            }
+        }
+        return nil
+    }
+
+    /// Extracts a unified diff from the model response, including from markdown code blocks or trailing prose.
+    private func extractPatch(from text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.contains("---"), trimmed.contains("@@") {
+            if let backtick = trimmed.range(of: "```") {
+                let after = trimmed[backtick.upperBound...]
+                if let endBlock = after.range(of: "```") {
+                    let block = String(after[..<endBlock.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    if block.contains("---"), block.contains("@@") { return block }
+                }
+            }
+            if let start = trimmed.range(of: "---") {
+                let fromStart = String(trimmed[start.lowerBound...])
+                if let end = fromStart.range(of: "\n```") {
+                    return String(fromStart[..<end.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                return fromStart.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        if let backtick = trimmed.range(of: "```") {
+            let after = trimmed[backtick.upperBound...]
+            if let endBlock = after.range(of: "```") {
+                let block = String(after[..<endBlock.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+                if block.contains("---"), block.contains("@@") { return block }
+            }
         }
         return nil
     }

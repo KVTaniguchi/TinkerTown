@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run the TinkerTown CLI from any workspace. Build first: cd TinkerTown && swift build -c release
+# Usage: from your workspace (e.g. TodoExample), run:
+#   ~/Development/TinkerTown/scripts/tinkertown-cli summary run_20260309_155935
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="$ROOT/.build/release/tinkertown"
+if [[ ! -x "$BIN" ]]; then
+  echo "TinkerTown CLI not built. From TinkerTown repo run: swift build -c release" >&2
+  exit 1
+fi
+exec "$BIN" "$@"

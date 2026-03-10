@@ -3,6 +3,7 @@ import Foundation
 public enum RunState: String, Codable, CaseIterable, Sendable {
     case runCreated = "RUN_CREATED"
     case planning = "PLANNING"
+    case pendingApproval = "PENDING_APPROVAL"
     case tasksReady = "TASKS_READY"
     case executing = "EXECUTING"
     case merging = "MERGING"
@@ -79,12 +80,137 @@ public struct TaskResult: Codable, Equatable, Sendable {
     public var mergeSHA: String?
     public var patchHash: String?
     public var promptHash: String?
+    /// SHA of the task branch HEAD at the time verification passed.
+    public var verifiedAtSHA: String?
 
-    public init(diffStats: DiffStats = DiffStats(), mergeSHA: String? = nil, patchHash: String? = nil, promptHash: String? = nil) {
+    public init(
+        diffStats: DiffStats = DiffStats(),
+        mergeSHA: String? = nil,
+        patchHash: String? = nil,
+        promptHash: String? = nil,
+        verifiedAtSHA: String? = nil
+    ) {
         self.diffStats = diffStats
         self.mergeSHA = mergeSHA
         self.patchHash = patchHash
         self.promptHash = promptHash
+        self.verifiedAtSHA = verifiedAtSHA
+    }
+}
+
+// MARK: - Product Design Requirement (PDR)
+
+/// Product Design Requirement document. Required before any run can start; Mayor uses it to produce the task list.
+public struct PDRRecord: Codable, Equatable, Sendable {
+    public var pdrId: String
+    public var version: Int
+    public var createdAt: Date
+    public var updatedAt: Date
+    public var title: String
+    public var summary: String
+    public var scope: String
+    public var acceptanceCriteria: [String]
+    public var constraints: String?
+    public var outOfScope: String?
+
+    public init(
+        pdrId: String,
+        version: Int = 1,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date(),
+        title: String,
+        summary: String = "",
+        scope: String = "",
+        acceptanceCriteria: [String] = [],
+        constraints: String? = nil,
+        outOfScope: String? = nil
+    ) {
+        self.pdrId = pdrId
+        self.version = version
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+        self.title = title
+        self.summary = summary
+        self.scope = scope
+        self.acceptanceCriteria = acceptanceCriteria
+        self.constraints = constraints
+        self.outOfScope = outOfScope
+    }
+
+    public func validate() throws {
+        guard !pdrId.isEmpty else { throw ContractError.invalidRecord("pdr_id is required") }
+        guard !title.isEmpty else { throw ContractError.invalidRecord("title is required") }
+    }
+
+    /// Summary string for Mayor/Tinker context (title, summary, scope, acceptance criteria).
+    public var contextSummary: String {
+        var parts: [String] = ["PDR: \(title)"]
+        if !summary.isEmpty { parts.append("Summary: \(summary)") }
+        if !scope.isEmpty { parts.append("Scope: \(scope)") }
+        if !acceptanceCriteria.isEmpty {
+            parts.append("Acceptance criteria: " + acceptanceCriteria.joined(separator: "; "))
+        }
+        if let c = constraints, !c.isEmpty { parts.append("Constraints: \(c)") }
+        if let o = outOfScope, !o.isEmpty { parts.append("Out of scope: \(o)") }
+        return parts.joined(separator: "\n")
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case pdrId = "pdr_id"
+        case version
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+        case title
+        case summary
+        case scope
+        case acceptanceCriteria = "acceptance_criteria"
+        case constraints
+        case outOfScope = "out_of_scope"
+    }
+}
+
+/// Optional goal/spec model for run-level progress. v1: one implicit goal per run (request); extend with goalIDs later.
+public struct GoalSpec: Codable, Equatable, Sendable {
+    public var id: String
+    public var title: String
+    public var acceptanceCriteria: String?
+
+    public init(id: String, title: String, acceptanceCriteria: String? = nil) {
+        self.id = id
+        self.title = title
+        self.acceptanceCriteria = acceptanceCriteria
+    }
+}
+
+/// Per-goal progress for UI (e.g. checklist, % complete).
+public struct GoalProgressItem: Codable, Equatable, Sendable {
+    public var goalId: String
+    public var title: String
+    public var completed: Bool
+    public var taskCount: Int
+    public var completedCount: Int
+
+    public init(goalId: String, title: String, completed: Bool, taskCount: Int, completedCount: Int) {
+        self.goalId = goalId
+        self.title = title
+        self.completed = completed
+        self.taskCount = taskCount
+        self.completedCount = completedCount
+    }
+}
+
+/// Summary of project progress against goals for StatusAgent and UI.
+public struct GoalProgressSummary: Codable, Equatable, Sendable {
+    public var progressPercent: Double
+    public var goalsTotal: Int
+    public var goalsCompleted: Int
+    public var items: [GoalProgressItem]
+
+    public init(progressPercent: Double, goalsTotal: Int, goalsCompleted: Int, items: [GoalProgressItem]) {
+        self.progressPercent = progressPercent
+        self.goalsTotal = goalsTotal
+        self.goalsCompleted = goalsCompleted
+        self.items = items
     }
 }
 
@@ -99,6 +225,15 @@ public struct RunRecord: Codable, Equatable, Sendable {
     public var headBranch: String?
     public var config: OrchestratorConfig
     public var taskIDs: [String]
+    /// Optional goal IDs this run contributes to; nil or empty = single implicit goal (request).
+    public var goalIDs: [String]?
+    /// PDR used for planning; nil for runs created before PDR was required (backward compat).
+    public var pdrId: String?
+    /// Resolved path to PDR file at run creation (audit).
+    public var pdrPath: String?
+    /// PDR context summary for Tinker (acceptance criteria, constraints); set at plan time.
+    public var pdrContextSummary: String?
+
     public var metrics: RunMetrics
 
     public init(
@@ -112,6 +247,10 @@ public struct RunRecord: Codable, Equatable, Sendable {
         headBranch: String? = nil,
         config: OrchestratorConfig,
         taskIDs: [String] = [],
+        goalIDs: [String]? = nil,
+        pdrId: String? = nil,
+        pdrPath: String? = nil,
+        pdrContextSummary: String? = nil,
         metrics: RunMetrics = RunMetrics()
     ) {
         self.schemaVersion = schemaVersion
@@ -124,10 +263,17 @@ public struct RunRecord: Codable, Equatable, Sendable {
         self.headBranch = headBranch
         self.config = config
         self.taskIDs = taskIDs
+        self.goalIDs = goalIDs
+        self.pdrId = pdrId
+        self.pdrPath = pdrPath
+        self.pdrContextSummary = pdrContextSummary
         self.metrics = metrics
     }
 
     public func validate() throws {
+        guard schemaVersion == 1 else {
+            throw ContractError.invalidRecord("unsupported RunRecord schema version \(schemaVersion)")
+        }
         guard !runID.isEmpty else { throw ContractError.invalidRecord("run_id is required") }
         guard !request.isEmpty else { throw ContractError.invalidRecord("request is required") }
     }
@@ -147,10 +293,16 @@ public struct TaskRecord: Codable, Equatable, Sendable {
     public var branch: String
     public var targetFiles: [String]
     public var coeditable: Bool
+    /// Optional goal this task contributes to; nil = part of implicit run goal.
+    public var goalId: String?
     public var retryCount: Int
     public var maxRetries: Int
     public var verify: VerifyResult
     public var result: TaskResult
+    /// Role currently or last acting on this task (e.g. "worker", "orchestrator").
+    public var currentActorRole: String?
+    /// Human-readable activity description (e.g. "verifying", "merging").
+    public var currentActivity: String?
 
     public init(
         schemaVersion: Int = 1,
@@ -166,10 +318,13 @@ public struct TaskRecord: Codable, Equatable, Sendable {
         branch: String,
         targetFiles: [String],
         coeditable: Bool = false,
+        goalId: String? = nil,
         retryCount: Int = 0,
         maxRetries: Int,
         verify: VerifyResult,
-        result: TaskResult = TaskResult()
+        result: TaskResult = TaskResult(),
+        currentActorRole: String? = nil,
+        currentActivity: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.taskID = taskID
@@ -184,13 +339,19 @@ public struct TaskRecord: Codable, Equatable, Sendable {
         self.branch = branch
         self.targetFiles = targetFiles
         self.coeditable = coeditable
+        self.goalId = goalId
         self.retryCount = retryCount
         self.maxRetries = maxRetries
         self.verify = verify
         self.result = result
+        self.currentActorRole = currentActorRole
+        self.currentActivity = currentActivity
     }
 
     public func validate() throws {
+        guard schemaVersion == 1 else {
+            throw ContractError.invalidRecord("unsupported TaskRecord schema version \(schemaVersion)")
+        }
         guard !taskID.isEmpty else { throw ContractError.invalidRecord("task_id is required") }
         guard !runID.isEmpty else { throw ContractError.invalidRecord("run_id is required") }
         guard maxRetries >= 0 else { throw ContractError.invalidRecord("max_retries must be >= 0") }
@@ -257,8 +418,22 @@ public struct RunEvent: Codable, Equatable, Sendable {
     public var from: String?
     public var to: String?
     public var meta: [String: String]
+    /// Role that produced this event (e.g. "planner", "worker", "orchestrator", "monitor").
+    public var actorRole: String?
+    /// Optional stable identity for multi-agent setups.
+    public var actorId: String?
 
-    public init(ts: Date = Date(), runID: String, taskID: String? = nil, type: String, from: String? = nil, to: String? = nil, meta: [String: String] = [:]) {
+    public init(
+        ts: Date = Date(),
+        runID: String,
+        taskID: String? = nil,
+        type: String,
+        from: String? = nil,
+        to: String? = nil,
+        meta: [String: String] = [:],
+        actorRole: String? = nil,
+        actorId: String? = nil
+    ) {
         self.ts = ts
         self.runID = runID
         self.taskID = taskID
@@ -266,6 +441,8 @@ public struct RunEvent: Codable, Equatable, Sendable {
         self.from = from
         self.to = to
         self.meta = meta
+        self.actorRole = actorRole
+        self.actorId = actorId
     }
 }
 

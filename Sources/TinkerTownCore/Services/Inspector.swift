@@ -16,9 +16,20 @@ public struct Inspector {
     }
 
     public func selectCommand(config: VerificationConfig, root: URL) -> String {
+        // Explicit modes first.
+        if config.mode == "none" { return "true" }
         if config.mode == "spm" { return "swift build" }
         if config.mode == "xcodebuild" { return config.command }
-        if FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path) { return "swift build" }
+
+        // Auto-mode: infer from repo contents so the agent doesn't run the wrong verifier (e.g. swift build in a Node repo).
+        let hasPackageSwift = FileManager.default.fileExists(atPath: root.appendingPathComponent("Package.swift").path)
+        if hasPackageSwift {
+            return "swift build"
+        }
+        let hasPackageJson = FileManager.default.fileExists(atPath: root.appendingPathComponent("package.json").path)
+        if hasPackageJson {
+            return "true"
+        }
         return config.command
     }
 
@@ -30,7 +41,7 @@ public struct Inspector {
         return InspectionOutcome(
             exitCode: result.exitCode,
             diagnostics: diagnostics,
-            errorClass: result.exitCode == 0 ? nil : .buildCompile
+            errorClass: command == "true" ? nil : (result.exitCode == 0 ? nil : .buildCompile)
         )
     }
 
