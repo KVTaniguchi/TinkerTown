@@ -21,6 +21,7 @@ public struct EventLogger {
     private let codec: JSONCodec
     private let paths: AppPaths
     private let redactor: Redactor
+    private let appendLock = NSLock()
 
     public init(fs: FileSysteming = LocalFileSystem(), codec: JSONCodec = JSONCodec(), paths: AppPaths, redactor: Redactor = Redactor()) {
         self.fs = fs
@@ -33,6 +34,8 @@ public struct EventLogger {
         let file = paths.eventsFile(event.runID)
         let data = try codec.encoder.encode(event)
         guard let line = String(data: data, encoding: .utf8) else { return }
+        appendLock.lock()
+        defer { appendLock.unlock() }
         try fs.append(redactor.redact(line) + "\n", to: file)
     }
 

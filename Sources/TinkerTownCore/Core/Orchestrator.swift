@@ -97,6 +97,11 @@ public struct DefaultTinkerAdapter: TinkerAdapting {
     }
 }
 
+private struct TaskOutcome {
+    var retriesUsed: Int = 0
+    var failed: Bool = false
+}
+
 public struct Orchestrator {
     private let root: URL
     private let paths: AppPaths
@@ -273,8 +278,28 @@ public struct Orchestrator {
                 continue
             }
 
+            let taskQueue = DispatchQueue(label: "tinkertown.tasks", attributes: .concurrent)
+            let group = DispatchGroup()
+            let outcomeLock = NSLock()
+            var outcomes: [TaskOutcome] = []
+
             for task in runnable {
-                try executeTask(task, run: &runRecord)
+                group.enter()
+                let runSnapshot = runRecord
+                taskQueue.async {
+                    defer { group.leave() }
+                    let outcome = (try? self.executeTask(task, run: runSnapshot))
+                        ?? TaskOutcome(failed: true)
+                    outcomeLock.lock()
+                    outcomes.append(outcome)
+                    outcomeLock.unlock()
+                }
+            }
+            group.wait()
+
+            for outcome in outcomes {
+                if outcome.failed { runRecord.metrics.tasksFailed += 1 }
+                runRecord.metrics.totalRetries += outcome.retriesUsed
             }
         }
 
@@ -297,8 +322,9 @@ public struct Orchestrator {
         try store.saveRun(runRecord)
     }
 
-    private func executeTask(_ task: TaskRecord, run: inout RunRecord) throws {
+    private func executeTask(_ task: TaskRecord, run: RunRecord) throws -> TaskOutcome {
         var task = task
+        var taskResult = TaskOutcome()
         let worktree = try worktrees.create(taskID: task.taskID, root: root, baseBranch: run.baseBranch)
         task.worktreePath = worktree.path
         task.branch = worktree.branch
@@ -314,7 +340,7 @@ public struct Orchestrator {
             try transitionTask(&task, to: .verifyPassed)
             try transitionTask(&task, to: .mergeReady)
             try store.saveTask(task)
-            return
+            return taskResult
         }
 
         var attempts = task.retryCount
@@ -337,14 +363,14 @@ public struct Orchestrator {
                 task.verify = VerifyResult(command: task.verify.command, exitCode: 1, diagnostics: [])
                 if attempts >= task.maxRetries {
                     try transitionTask(&task, to: .failed)
-                    run.metrics.tasksFailed += 1
+                    taskResult.failed = true
                     try store.saveTask(task)
-                    return
+                    return taskResult
                 }
                 try transitionTask(&task, to: .verifyFailedRetryable)
                 attempts += 1
                 task.retryCount = attempts
-                run.metrics.totalRetries += 1
+                taskResult.retriesUsed += 1
                 try store.saveTask(task)
                 sleep(inspector.backoffSeconds(attempt: attempts - 1))
                 continue
@@ -376,14 +402,14 @@ public struct Orchestrator {
                     task.verify = VerifyResult(command: command, exitCode: 1, diagnostics: [])
                     if attempts >= task.maxRetries {
                         try transitionTask(&task, to: .failed)
-                        run.metrics.tasksFailed += 1
+                        taskResult.failed = true
                         try store.saveTask(task)
-                        return
+                        return taskResult
                     }
                     try transitionTask(&task, to: .verifyFailedRetryable)
                     attempts += 1
                     task.retryCount = attempts
-                    run.metrics.totalRetries += 1
+                    taskResult.retriesUsed += 1
                     try store.saveTask(task)
                     sleep(inspector.backoffSeconds(attempt: attempts - 1))
                     continue
@@ -425,23 +451,24 @@ public struct Orchestrator {
                 try transitionTask(&task, to: .verifyPassed)
                 try transitionTask(&task, to: .mergeReady)
                 try store.saveTask(task)
-                return
+                return taskResult
             }
 
             if attempts >= task.maxRetries {
                 try transitionTask(&task, to: .failed)
-                run.metrics.tasksFailed += 1
+                taskResult.failed = true
                 try store.saveTask(task)
-                return
+                return taskResult
             }
 
             try transitionTask(&task, to: .verifyFailedRetryable)
             attempts += 1
             task.retryCount = attempts
-            run.metrics.totalRetries += 1
+            taskResult.retriesUsed += 1
             try store.saveTask(task)
             sleep(inspector.backoffSeconds(attempt: attempts - 1))
         }
+        return taskResult
     }
 
     /// Working directory for verification. When all target files live under one subdirectory (e.g. backend/),
