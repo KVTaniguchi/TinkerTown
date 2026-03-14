@@ -37,7 +37,7 @@ public struct OllamaMayorAdapter: MayorAdapting {
         Optional fields (strongly recommended):
         - "component_kind" (string, e.g. "backend_api", "web_app", "ios_app")
         - "component_id" (string shared by tasks in the same component)
-        - "verification_command" (string, e.g. "npm test", "swift build", "true")
+        - "verification_command" (string, e.g. "npm test", "swift build", "true"). When target_files are all under one directory (e.g. backend/), verification runs from that directory—use "npm start" or "npm test", not "cd backend && ...".
 
         target_files: Use real source/config paths the implementation will touch. Examples: "backend/server.js", "package.json", "frontend/src/App.jsx", "api/task-schema.json", "db/schema.sql". Only use "tinkertown-task-notes.md" for meta or documentation-only tasks. Prefer concrete paths (e.g. server.js, package.json, src/App.jsx) so the coding agent writes application code, not notes.
 
@@ -61,7 +61,8 @@ public struct OllamaMayorAdapter: MayorAdapting {
     }
 
     private func parsePlannedTasks(from jsonText: String) -> [PlannedTask]? {
-        let trimmed = jsonText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let stripped = Self.stripMarkdownCodeBlock(jsonText)
+        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8),
               let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return nil
@@ -69,9 +70,11 @@ public struct OllamaMayorAdapter: MayorAdapting {
         var result: [PlannedTask] = []
         for (_, item) in raw.enumerated() {
             guard let title = item["title"] as? String, !title.isEmpty else { continue }
+            // Skip tasks with missing or empty target_files — they indicate a malformed plan
+            // and would silently become doc-writing tasks if we allowed a fallback to notes.md.
+            guard let targetFiles = item["target_files"] as? [String], !targetFiles.isEmpty else { continue }
             let priority = (item["priority"] as? Int).map { min(3, max(1, $0)) } ?? 1
             let dependsOn = (item["depends_on"] as? [String]) ?? []
-            let targetFiles = (item["target_files"] as? [String]) ?? ["tinkertown-task-notes.md"]
             let componentKind = item["component_kind"] as? String
             let componentId = item["component_id"] as? String
             let verificationCommand = item["verification_command"] as? String
@@ -79,13 +82,28 @@ public struct OllamaMayorAdapter: MayorAdapting {
                 title: title,
                 priority: priority,
                 dependsOn: dependsOn,
-                targetFiles: targetFiles.isEmpty ? ["tinkertown-task-notes.md"] : targetFiles,
+                targetFiles: targetFiles,
                 componentKind: componentKind,
                 componentId: componentId,
                 verificationCommand: verificationCommand
             ))
         }
         return result.isEmpty ? nil : result
+    }
+
+    /// Strips optional markdown code fence so JSON can be parsed when the model returns ```json\n...\n```.
+    private static func stripMarkdownCodeBlock(_ text: String) -> String {
+        let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("```") {
+            let rest = s.dropFirst(3)
+            let afterLang = rest.hasPrefix("json") ? rest.dropFirst(4) : rest
+            let start = afterLang.drop(while: { $0.isNewline })
+            if let end = start.range(of: "\n```") {
+                return String(start[..<end.lowerBound])
+            }
+            return String(start)
+        }
+        return s
     }
 }
 
@@ -123,7 +141,8 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
         1. A unified diff (patch) that applies with `git apply`. Output ONLY the diff: start with a line "--- a/<path>" or "--- /dev/null", then "+++ b/<path>", then hunk headers "@@ ... @@". Use paths relative to the repo root (e.g. a/server.js b/server.js). For NEW files use "--- /dev/null" and "+++ b/path/to/newfile". No explanation, no markdown, no code fences—just the raw diff.
         2. Or one line: EXPLAIN: <short reason> only if the task is impossible (e.g. missing info).
 
-        You are building a real application. Implement the requested change in code. Do not write to tinkertown-task-notes.md or other docs as the deliverable; produce the actual source/config/test changes as a unified diff.
+        You are building a real application. Implement the requested change in code. Do not write to tinkertown-task-notes.md or other docs as the deliverable; produce the actual source/config/test changes as a unified diff. Ensure every file in your diff is complete and syntactically valid (e.g. all braces and brackets closed). If the context includes "Previous verification failed", fix the reported errors and output a full, runnable patch—do not truncate.
+        Prefer minimal edits: when target files already exist (e.g. backend/server.js), patch only what is needed instead of replacing the entire file, so the response stays short and complete.
         """
         let fileList = task.targetFiles.joined(separator: ", ")
         // Best-effort context: read contents of small target files.
@@ -137,8 +156,10 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
             }
         }
         let contextFiles = fileSnippets.joined(separator: "\n\n")
+        let wasTruncated = context.contains("Unexpected end of input") || context.contains("SyntaxError")
+        let truncationWarning = wasTruncated ? "\nCRITICAL: The previous attempt was truncated or had a syntax error. Your diff MUST be a complete, runnable file with all braces/brackets closed. Prefer a minimal patch that only adds the missing parts or fixes the error; if you must replace the file, output the FULL file in the diff and do not cut off.\n" : ""
         let prompt = """
-        Implement this task by changing the target files. Output only a unified diff (no prose, no markdown).
+        Implement this task by changing the target files. Output only a unified diff (no prose, no markdown).\(truncationWarning)
 
         Task: \(task.title)
         Context: \(context)
@@ -150,10 +171,6 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
         """
         guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system),
               let resultMessage = try handleResponse(response, worktree: worktree) else {
-            let isNotesOnly = task.targetFiles.allSatisfy { $0 == "tinkertown-task-notes.md" }
-            if isNotesOnly {
-                return try fallback.apply(task: task, context: context, worktree: worktree)
-            }
             throw TinkerError(taskTitle: task.title, targetFiles: task.targetFiles)
         }
         return resultMessage
@@ -169,7 +186,9 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
             if try applyPatch(patch, worktree: worktree) {
                 return "Applied patch from Ollama (\(patch.count) characters)."
             } else {
-                return "EXPLAIN: Model produced a patch but it failed to apply with git. Check for conflicts or invalid paths."
+                // Return nil so the caller treats this as a Tinker failure and retries,
+                // rather than silently passing verification with no code written.
+                return nil
             }
         }
         return nil

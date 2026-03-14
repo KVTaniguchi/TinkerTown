@@ -16,19 +16,15 @@ struct MayorTinkerAdapterTests {
         #expect(titles.contains(where: { $0.lowercased().contains("api") }))
         #expect(titles.contains(where: { $0.lowercased().contains("tests") }))
         #expect(tasks[0].priority >= tasks[1].priority)
-        #expect(tasks.allSatisfy { $0.targetFiles == ["tinkertown-task-notes.md"] })
+        // DefaultMayorAdapter derives code target files from titles; "api" task gets api/*.json, not notes-only.
+        let apiTask = tasks.first(where: { $0.title.lowercased().contains("api") })
+        #expect(apiTask != nil)
+        #expect(apiTask!.targetFiles.contains(where: { $0.contains("api") || $0.contains("schema") }))
     }
 
-    @Test func tinkerWritesNotesInsideWorktreeAndUsesGuardrails() throws {
-        let fs = InMemoryFileSystem()
-        let root = URL(fileURLWithPath: "/repo")
-        let worktree = root.appendingPathComponent(".tinkertown/task_001")
-        try fs.createDirectory(worktree)
-
+    @Test func tinkerThrowsWhenNoModelAvailable() {
         let guardrails = GuardrailService(config: GuardrailConfig(enforcePathSandbox: true, blockedCommands: []))
-        let shell = StubShell(results: [
-            "printf '%s\\n' 'Task: T' 'Context: C' >> tinkertown-task-notes.md": ShellResult(exitCode: 0, stdout: "", stderr: "")
-        ])
+        let shell = StubShell(results: [:])
         let tinker = DefaultTinkerAdapter(shell: shell, guardrails: guardrails)
         let task = TaskRecord(
             taskID: "task_001",
@@ -39,13 +35,16 @@ struct MayorTinkerAdapterTests {
             assignedModel: "m",
             worktreePath: ".tinkertown/task_001",
             branch: "tinkertown/task_001",
-            targetFiles: ["tinkertown-task-notes.md"],
+            targetFiles: ["src/main.swift"],
             maxRetries: 3,
             verify: VerifyResult(command: "swift build")
         )
+        let worktree = URL(fileURLWithPath: "/repo/.tinkertown/task_001")
 
-        let command = try tinker.apply(task: task, context: "C", worktree: worktree)
-        #expect(command.contains("tinkertown-task-notes.md"))
+        // DefaultTinkerAdapter has no model — it must throw rather than silently write documentation.
+        #expect(throws: TinkerError.self) {
+            _ = try tinker.apply(task: task, context: "C", worktree: worktree)
+        }
     }
 }
 

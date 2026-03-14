@@ -49,10 +49,35 @@ public struct DefaultMayorAdapter: MayorAdapting {
         let parts = effectiveRequest.components(separatedBy: " and ").filter { !$0.isEmpty }
         if parts.count > 1 {
             return parts.enumerated().map { idx, part in
-                PlannedTask(title: part.capitalized, priority: max(1, 3 - idx), targetFiles: ["tinkertown-task-notes.md"])
+                let title = part.capitalized
+                let targets = Self.targetFilesFromTitle(title)
+                return PlannedTask(title: title, priority: max(1, 3 - idx), targetFiles: targets)
             }
         }
-        return [PlannedTask(title: effectiveRequest.capitalized, targetFiles: ["tinkertown-task-notes.md"])]
+        let title = effectiveRequest.capitalized
+        let targets = Self.targetFilesFromTitle(title)
+        return [PlannedTask(title: title, targetFiles: targets)]
+    }
+
+    /// Derives plausible code target files from task title so the worker writes application code, not notes.
+    /// Used when no LLM Mayor is available; prefers real source/config paths over tinkertown-task-notes.md.
+    static func targetFilesFromTitle(_ title: String) -> [String] {
+        let lower = title.lowercased()
+        var files: [String] = []
+        if lower.contains("api") || lower.contains("schema") || lower.contains("endpoint") || lower.contains("rest") || lower.contains("json schema") {
+            files.append(contentsOf: ["api/task-schema.json", "api/schema.json"])
+        }
+        if lower.contains("backend") || lower.contains("server") || lower.contains("sqlite") || lower.contains("database") || lower.contains("node") || lower.contains("python") {
+            files.append(contentsOf: ["backend/server.js", "package.json", "db/schema.sql"])
+        }
+        if lower.contains("frontend") || lower.contains("ui") || lower.contains("component") || lower.contains("input") || lower.contains("list") || lower.contains("display") || lower.contains("styling") {
+            files.append(contentsOf: ["frontend/src/App.jsx", "src/App.jsx", "index.html"])
+        }
+        if lower.contains("integration") || lower.contains("connect") || lower.contains("fetch") || lower.contains("crud") {
+            if files.isEmpty { files.append(contentsOf: ["frontend/src/App.jsx", "backend/server.js"]) }
+        }
+        let unique = Array(Set(files)).sorted()
+        return unique.isEmpty ? ["tinkertown-task-notes.md"] : unique
     }
 }
 
@@ -66,13 +91,9 @@ public struct DefaultTinkerAdapter: TinkerAdapting {
     }
 
     public func apply(task: TaskRecord, context: String, worktree: URL) throws -> String {
-        // v1 local deterministic placeholder patch to keep worker path/testable execution contract.
-        let note = "tinkertown-task-notes.md"
-        let command = "printf '%s\\n' 'Task: \(task.title)' 'Context: \(context)' >> \(note)"
-        try guardrails.validateCommand(command)
-        try guardrails.validatePath(worktree.appendingPathComponent(note), inside: worktree)
-        _ = try shell.run(command, cwd: worktree)
-        return command
+        // DefaultTinkerAdapter has no model to generate code — throw so the retry loop
+        // treats this as a real failure rather than silently writing documentation.
+        throw TinkerError(taskTitle: task.title, targetFiles: task.targetFiles)
     }
 }
 
@@ -88,6 +109,7 @@ public struct Orchestrator {
     private let mergeManager: MergeManaging
     private let mayor: MayorAdapting
     private let tinker: TinkerAdapting
+    private let scaffolder: Scaffolder
 
     public init(
         root: URL,
@@ -100,7 +122,8 @@ public struct Orchestrator {
         scheduler: Scheduler,
         mergeManager: MergeManaging,
         mayor: MayorAdapting,
-        tinker: TinkerAdapting
+        tinker: TinkerAdapting,
+        scaffolder: Scaffolder = Scaffolder()
     ) {
         self.root = root
         self.paths = paths
@@ -113,6 +136,7 @@ public struct Orchestrator {
         self.mergeManager = mergeManager
         self.mayor = mayor
         self.tinker = tinker
+        self.scaffolder = scaffolder
     }
 
     /// Caller must resolve PDR (e.g. via PDRService.resolve) before calling. Then plan and execute.
@@ -128,10 +152,12 @@ public struct Orchestrator {
     public func generatePlan(request: String, pdr: PDRRecord, pdrResolvedURL: URL, skipApproval: Bool = false) throws -> String {
         let runID = makeRunID()
         try store.ensureRunDirectories(runID: runID)
+        let baseBranch = try GitDefaultBranch().detect(at: root)
         var runRecord = RunRecord(
             runID: runID,
             state: .runCreated,
             request: request,
+            baseBranch: baseBranch,
             config: config.orchestrator,
             pdrId: pdr.pdrId,
             pdrPath: pdrResolvedURL.path,
@@ -140,7 +166,12 @@ public struct Orchestrator {
         try store.saveRun(runRecord)
 
         try transitionRun(&runRecord, to: .planning, actorRole: "planner")
-        let plan = mayor.plan(pdr: pdr, request: request)
+        let rawPlan = mayor.plan(pdr: pdr, request: request)
+        // Drop any tasks whose only target is tinkertown-task-notes.md — these indicate
+        // planning failures and would cause agents to loop writing documentation instead of code.
+        let plan = rawPlan.filter { task in
+            !task.targetFiles.allSatisfy { $0 == "tinkertown-task-notes.md" }
+        }
 
         var tasks: [TaskRecord] = []
         for (index, planned) in plan.enumerated() {
@@ -157,7 +188,7 @@ public struct Orchestrator {
                 assignedModel: config.models.tinker,
                 worktreePath: ".tinkertown/\(taskID)",
                 branch: "tinkertown/\(taskID)",
-                targetFiles: planned.targetFiles.isEmpty ? ["tinkertown-task-notes.md"] : planned.targetFiles,
+                targetFiles: planned.targetFiles,
                 maxRetries: config.orchestrator.maxRetriesPerTask,
                 verify: VerifyResult(command: verificationCommand)
             )
@@ -198,6 +229,9 @@ public struct Orchestrator {
             try transitionRun(&runRecord, to: .executing)
         }
         // When already .executing, no transition; proceed into the loop.
+
+        // Clear leftover worktrees/branches from previous runs so this run can create task worktrees.
+        worktrees.cleanupOrphaned(root: root)
 
         if let approved = approvedTaskIDs {
             var tasks = try store.listTasks(runID: runID)
@@ -268,6 +302,10 @@ public struct Orchestrator {
         let worktree = try worktrees.create(taskID: task.taskID, root: root, baseBranch: run.baseBranch)
         task.worktreePath = worktree.path
         task.branch = worktree.branch
+        let worktreeURL = root.appendingPathComponent(task.worktreePath)
+        if task.targetFiles.contains("backend/server.js") {
+            try? scaffolder.createNodeBackend(at: worktreeURL)
+        }
         try transitionTask(&task, to: .worktreeReady)
 
         // Plan-only mode: record tasks and skip edits + verification.
@@ -280,21 +318,84 @@ public struct Orchestrator {
         }
 
         var attempts = task.retryCount
+        var lastVerifyOutput: String?
         while attempts <= task.maxRetries {
             try transitionTask(&task, to: .prompted)
             let worktreeURL = root.appendingPathComponent(task.worktreePath)
             let promptText = "Task \(task.title), files: \(task.targetFiles.joined(separator: ","))"
             let promptHash = sha256Hex(promptText)
-            let tinkerContext = buildTinkerContext(run: run)
-            _ = try tinker.apply(task: task, context: tinkerContext, worktree: worktreeURL)
+            let previousVerifyLog: String? = lastVerifyOutput ?? (attempts > 0 ? (try? String(contentsOf: paths.taskAttemptLog(run.runID, task.taskID, attempts), encoding: .utf8)) : nil)
+            let tinkerContext = buildTinkerContext(run: run, previousVerifyLog: previousVerifyLog)
+            do {
+                _ = try tinker.apply(task: task, context: tinkerContext, worktree: worktreeURL)
+            } catch {
+                // Tinker failed to produce or apply a patch. Treat like a verification failure
+                // so the retry loop handles it instead of crashing the whole run.
+                let message = error.localizedDescription
+                lastVerifyOutput = message
+                try? events.appendRawLog(runID: run.runID, taskID: task.taskID, attempt: attempts + 1, content: message)
+                task.verify = VerifyResult(command: task.verify.command, exitCode: 1, diagnostics: [])
+                if attempts >= task.maxRetries {
+                    try transitionTask(&task, to: .failed)
+                    run.metrics.tasksFailed += 1
+                    try store.saveTask(task)
+                    return
+                }
+                try transitionTask(&task, to: .verifyFailedRetryable)
+                attempts += 1
+                task.retryCount = attempts
+                run.metrics.totalRetries += 1
+                try store.saveTask(task)
+                sleep(inspector.backoffSeconds(attempt: attempts - 1))
+                continue
+            }
             task.result.promptHash = promptHash
             task.result.patchHash = sha256Hex("task:\(task.taskID)-attempt:\(attempts)")
 
             try transitionTask(&task, to: .patchApplied)
             try transitionTask(&task, to: .verifying)
 
-            let command = task.verify.command
-            let outcome = try inspector.verify(task: task, runID: run.runID, attempt: attempts + 1, command: command, cwd: worktreeURL)
+            let verifyCwd = verifyWorkingDirectory(for: task.targetFiles, in: worktreeURL)
+            // For backend/server.js tasks, verify with syntax-only so we never run truncated code. Use backend dir so server.js is found.
+            let backendCwd = worktreeURL.appendingPathComponent("backend")
+            let isBackendServerTask = task.targetFiles.contains("backend/server.js")
+            let (command, effectiveCwd): (String, URL) = isBackendServerTask
+                ? ("node -c server.js", backendCwd)
+                : (task.verify.command, verifyCwd)
+
+            // If this task touches backend/server.js, run syntax check first. If the model's patch left invalid JS, restore scaffold and retry with a minimal-patch directive.
+            if isBackendServerTask {
+                let shell = ShellRunner()
+                let syntaxResult = try? shell.run("node -c server.js", cwd: backendCwd)
+                if syntaxResult?.exitCode != 0 {
+                    try? scaffolder.restoreNodeBackend(at: worktreeURL)
+                    let syntaxOut = [syntaxResult?.stdout, syntaxResult?.stderr].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: "\n")
+                    let message = (syntaxOut.isEmpty ? "node -c server.js failed" : syntaxOut) + "\n\nRestored minimal server. On the next attempt output ONLY a minimal patch: add one route or feature at a time; do not replace server.js entirely."
+                    lastVerifyOutput = message
+                    try? events.appendRawLog(runID: run.runID, taskID: task.taskID, attempt: attempts + 1, content: message)
+                    task.verify = VerifyResult(command: command, exitCode: 1, diagnostics: [])
+                    if attempts >= task.maxRetries {
+                        try transitionTask(&task, to: .failed)
+                        run.metrics.tasksFailed += 1
+                        try store.saveTask(task)
+                        return
+                    }
+                    try transitionTask(&task, to: .verifyFailedRetryable)
+                    attempts += 1
+                    task.retryCount = attempts
+                    run.metrics.totalRetries += 1
+                    try store.saveTask(task)
+                    sleep(inspector.backoffSeconds(attempt: attempts - 1))
+                    continue
+                }
+            }
+
+            let outcome = try inspector.verify(task: task, runID: run.runID, attempt: attempts + 1, command: command, cwd: effectiveCwd)
+            if outcome.exitCode != 0 {
+                lastVerifyOutput = outcome.rawOutput
+            } else {
+                lastVerifyOutput = nil
+            }
 
             // Capture simple diff stats for UI review before committing.
             if command != "true" {
@@ -341,6 +442,21 @@ public struct Orchestrator {
             try store.saveTask(task)
             sleep(inspector.backoffSeconds(attempt: attempts - 1))
         }
+    }
+
+    /// Working directory for verification. When all target files live under one subdirectory (e.g. backend/),
+    /// run the verify command from that subdirectory so commands like `npm start` find package.json.
+    private func verifyWorkingDirectory(for targetFiles: [String], in worktreeURL: URL) -> URL {
+        guard !targetFiles.isEmpty else { return worktreeURL }
+        let dirs = targetFiles.map { path -> String in
+            if let lastSlash = path.lastIndex(of: "/") {
+                return String(path[..<lastSlash])
+            }
+            return ""
+        }
+        let first = dirs[0]
+        guard !first.isEmpty, dirs.allSatisfy({ $0 == first }) else { return worktreeURL }
+        return worktreeURL.appendingPathComponent(first)
     }
 
     /// Create a task-scoped commit in the worktree when there are changes to the
@@ -402,12 +518,21 @@ public struct Orchestrator {
         }
     }
 
-    private func buildTinkerContext(run: RunRecord) -> String {
+    private func buildTinkerContext(run: RunRecord, previousVerifyLog: String? = nil) -> String {
         var parts: [String] = []
         if let pdr = run.pdrContextSummary, !pdr.isEmpty {
             parts.append(pdr)
         }
         parts.append("Request: \(run.request)")
+        if let log = previousVerifyLog, !log.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let directive: String
+            if log.contains("Unexpected end of input") || log.contains("SyntaxError") {
+                directive = "Previous verification failed because the file is TRUNCATED or has unclosed braces/brackets. You MUST output a COMPLETE unified diff that replaces the entire file with a full, runnable version. Do not truncate your response; include every line and close all { } [ ] ( )."
+            } else {
+                directive = "Previous verification failed. Fix the errors below and output a complete, syntactically valid patch."
+            }
+            parts.append("\(directive)\n\nVerification output:\n\(log)")
+        }
         return parts.joined(separator: "\n\n")
     }
 

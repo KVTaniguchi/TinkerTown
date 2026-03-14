@@ -13,7 +13,12 @@ public struct MergeGate {
         self.shell = shell
     }
 
-    public func validateScope(task: TaskRecord, root: URL) throws {
+    public func validateScope(task: TaskRecord, root: URL, baseBranch: String) throws {
+        // Reject tasks that only touch documentation — these indicate a planning or model failure.
+        if task.targetFiles.allSatisfy({ $0 == "tinkertown-task-notes.md" }) {
+            throw NSError(domain: "MergeGate", code: 5, userInfo: [NSLocalizedDescriptionKey: "Task '\(task.title)' targets only tinkertown-task-notes.md; no code was written. Rejecting to prevent documentation loops."])
+        }
+
         // Reject stale verification evidence: if we have a recorded verification SHA and it does
         // not match the current branch HEAD, force a fresh verify instead of merging.
         if let verifiedAt = task.result.verifiedAtSHA, !verifiedAt.isEmpty {
@@ -23,7 +28,7 @@ public struct MergeGate {
             }
         }
 
-        let diff = try shell.run("git diff --name-only main...\(task.branch)", cwd: root)
+        let diff = try shell.run("git diff --name-only \(baseBranch)...\(task.branch)", cwd: root)
         let touched = Set(diff.stdout.split(separator: "\n").map(String.init).filter { !$0.isEmpty })
         let allowed = Set(task.targetFiles)
         if !touched.isSubset(of: allowed) {
