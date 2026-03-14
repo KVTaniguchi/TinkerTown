@@ -12,6 +12,8 @@ TinkerTown is a local-first, autonomous multi-agent coding orchestrator. Inspire
 |-------------|-------------------|
 | ![TinkerTown app – repo, preflight, request, run](docs/screenshot-main.png) | ![Run detail, task list, log viewer](docs/screenshot-logs.png) |
 
+
+
 *Drop `screenshot-main.png` and `screenshot-logs.png` into `docs/` to show the app here. No images yet? The table still describes what you’ll see.*
 
 **CLI:** Same engine, different interface. A **Product Design Requirement (PDR)** is required before any run; use `.tinkertown/pdr.json` or `tinkertown pdr init` to create one, or `--pdr <path>` to use another file.
