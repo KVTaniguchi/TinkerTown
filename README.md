@@ -10,7 +10,7 @@ TinkerTown is a local-first, autonomous multi-agent coding orchestrator. Inspire
 
 | Main window | Task list & logs |
 |-------------|-------------------|
-| ![TinkerTown app – repo, preflight, request, run](docs/screenshot-main.png) | ![Run detail, task list, log viewer](docs/screenshot-logs.png) |
+|     | 
 
 
 
