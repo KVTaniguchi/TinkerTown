@@ -60,7 +60,7 @@ public struct OllamaMayorAdapter: MayorAdapting {
         return tasks
     }
 
-    private func parsePlannedTasks(from jsonText: String) -> [PlannedTask]? {
+    func parsePlannedTasks(from jsonText: String) -> [PlannedTask]? {
         let stripped = Self.stripMarkdownCodeBlock(jsonText)
         let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8),
@@ -92,7 +92,7 @@ public struct OllamaMayorAdapter: MayorAdapting {
     }
 
     /// Strips optional markdown code fence so JSON can be parsed when the model returns ```json\n...\n```.
-    private static func stripMarkdownCodeBlock(_ text: String) -> String {
+    static func stripMarkdownCodeBlock(_ text: String) -> String {
         let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if s.hasPrefix("```") {
             let rest = s.dropFirst(3)
