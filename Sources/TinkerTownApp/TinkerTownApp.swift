@@ -24,6 +24,24 @@ private struct SuggestedStep: Identifiable {
     let requestText: String
 }
 
+private struct ActivityFeedEntry: Identifiable {
+    let id = UUID()
+    let timestamp: Date
+    let icon: String
+    let actor: String
+    let message: String
+    enum Level { case info, success, failure, progress }
+    let level: Level
+    var iconColor: Color {
+        switch level {
+        case .info:     return .secondary
+        case .success:  return .green
+        case .failure:  return .red
+        case .progress: return Color.accentColor
+        }
+    }
+}
+
 @MainActor
 private final class AppViewModel: ObservableObject {
     @Published var repoURL: URL
@@ -59,8 +77,10 @@ private final class AppViewModel: ObservableObject {
     @Published var hasChosenRepository: Bool = false
     /// When the failure explanation mentions a button, we highlight it so the user knows what to press.
     @Published var highlightedButtonIDs: Set<String> = []
+    @Published var activityFeed: [ActivityFeedEntry] = []
 
     private let appContainerPaths: AppContainerPaths?
+    private var seenTaskStates: [String: TaskState] = [:]
     /// G3: Timer for live UI updates while orchestration runs in background.
     private var pollTimer: Timer?
     /// G4: Monitor that re-evaluates failed runs and can trigger resume.
@@ -326,6 +346,7 @@ private final class AppViewModel: ObservableObject {
     func runWithRequest(_ request: String) {
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        appendActivity("▶", actor: "app", message: "Starting: \(String(trimmed.prefix(80)))", level: .info)
         runOrchestrationInBackground { [repoURL] in
             let context = try self.makeContext(root: repoURL)
             try Self.ensureGitPreflight(cwd: repoURL)
@@ -511,9 +532,11 @@ private final class AppViewModel: ObservableObject {
                     updateFailureExplanationIfNeeded(runID: runID, taskID: selectedTaskID, logs: logsText)
                 }
                 statusMessage = "Run completed"
+                appendActivity("●", actor: "app", message: "Run completed", level: .success)
             case .failure(let error):
                 errorMessage = error.localizedDescription
                 statusMessage = "Failed"
+                appendActivity("!", actor: "app", message: error.localizedDescription, level: .failure)
                 try? refreshSelectedRun()
             }
             isBusy = false
@@ -530,6 +553,7 @@ private final class AppViewModel: ObservableObject {
         isBusy = false
         statusMessage = "Stopped"
         errorMessage = nil
+        appendActivity("■", actor: "app", message: "Run stopped by user", level: .info)
         try? refreshSelectedRun()
         if let runID = selectedRunID {
             updateFailureExplanationIfNeeded(runID: runID, taskID: selectedTaskID, logs: logsText)
@@ -546,11 +570,20 @@ private final class AppViewModel: ObservableObject {
         runRecord = run
         currentConfig = context.config
         tasks = taskList
+        updateActivityFeedFromTasks(taskList)
         logsText = logs
         preflightChecks = (try? Self.preflightChecks(root: repoURL, config: context.config)) ?? preflightChecks
         if run.state == .completed {
-            var titlesToMark = taskList.filter { [TaskState.merged, .cleaned].contains($0.state) }.map(\.title)
-            if let focusTitles = Self.focusTitlesFromRunRequest(run.request) {
+            // Only mark checklist items complete when at least one task actually produced file changes.
+            // This avoids marking e.g. "API contracts" done when tasks merged with 0 files changed.
+            let completedTasks = taskList.filter { [TaskState.merged, .cleaned].contains($0.state) }
+            let hasActualChanges: (TaskRecord) -> Bool = { task in
+                let d = task.result.diffStats
+                return d.files > 0 || d.insertions + d.deletions > 0
+            }
+            let tasksWithChanges = completedTasks.filter(hasActualChanges)
+            var titlesToMark = tasksWithChanges.map(\.title)
+            if !tasksWithChanges.isEmpty, let focusTitles = Self.focusTitlesFromRunRequest(run.request) {
                 titlesToMark.append(contentsOf: focusTitles)
             }
             if !titlesToMark.isEmpty {
@@ -962,11 +995,10 @@ private final class AppViewModel: ObservableObject {
             )
         }
 
-        // Double-check that the expected base branch exists.
-        let shell = ShellRunner()
-        let branch = try shell.run("git rev-parse --verify main", cwd: cwd)
-        guard branch.exitCode == 0 else {
-            throw NSError(domain: "TinkerTownApp", code: 2, userInfo: [NSLocalizedDescriptionKey: "Base branch 'main' not found."])
+        // Ensure a default branch exists (main, master, or origin/HEAD).
+        let defaultBranch = try GitDefaultBranch().detect(at: cwd)
+        guard !defaultBranch.isEmpty else {
+            throw NSError(domain: "TinkerTownApp", code: 2, userInfo: [NSLocalizedDescriptionKey: "No default branch found. Ensure the repository has a branch (e.g. main or master)."])
         }
     }
 
@@ -984,8 +1016,17 @@ private final class AppViewModel: ObservableObject {
         let repoOK = repoResult.exitCode == 0 && repoResult.stdout.trimmingCharacters(in: .whitespacesAndNewlines) == "true"
         checks.append(PreflightCheck(name: "git repo", ok: repoOK, detail: repoOK ? "OK" : "Not a repository"))
 
-        let mainResult = try shell.run("git rev-parse --verify main", cwd: root)
-        checks.append(PreflightCheck(name: "main branch", ok: mainResult.exitCode == 0, detail: mainResult.exitCode == 0 ? "OK" : "Missing"))
+        let defaultBranchDetector = GitDefaultBranch(shell: shell)
+        let defaultBranchOK: Bool
+        let defaultBranchDetail: String
+        if let detected = try? defaultBranchDetector.detect(at: root) {
+            defaultBranchOK = true
+            defaultBranchDetail = "\(detected)"
+        } else {
+            defaultBranchOK = false
+            defaultBranchDetail = "Missing"
+        }
+        checks.append(PreflightCheck(name: "default branch", ok: defaultBranchOK, detail: defaultBranchDetail))
 
         if config.shouldUseOllama {
             let ollamaResult = try shell.run("command -v ollama", cwd: root)
@@ -1023,68 +1064,101 @@ private final class AppViewModel: ObservableObject {
         }
         return try readRunLogs(paths: paths, runID: runID)
     }
-}
 
-private struct StatusBadge: View {
-    let ok: Bool
+    // MARK: - Activity feed
 
-    var body: some View {
-        Circle()
-            .fill(ok ? Color.green : Color.red)
-            .frame(width: 8, height: 8)
+    func clearForNewRun() {
+        selectedRunID = nil
+        runRecord = nil
+        tasks = []
+        logsText = ""
+        failureExplanation = nil
+        errorMessage = nil
+        statusMessage = "Ready"
+        activityFeed = []
+        seenTaskStates = [:]
+        requestText = ""
+    }
+
+    func appendActivity(_ icon: String, actor: String, message: String, level: ActivityFeedEntry.Level) {
+        let entry = ActivityFeedEntry(timestamp: .now, icon: icon, actor: actor, message: message, level: level)
+        activityFeed.append(entry)
+        if activityFeed.count > 500 {
+            activityFeed = Array(activityFeed.suffix(500))
+        }
+        AppLogger.shared.log(level == .failure ? "ERROR" : "INFO", actor: actor.uppercased(), message)
+    }
+
+    func updateActivityFeedFromTasks(_ newTasks: [TaskRecord]) {
+        for task in newTasks {
+            let prev = seenTaskStates[task.taskID]
+            guard prev != task.state else { continue }
+            seenTaskStates[task.taskID] = task.state
+            switch task.state {
+            case .worktreeReady:
+                appendActivity("⚙", actor: "tinker", message: "Setting up: \(task.title)", level: .progress)
+            case .prompted:
+                appendActivity("✎", actor: task.currentActorRole ?? "tinker", message: "Generating: \(task.title)", level: .progress)
+            case .patchApplied:
+                appendActivity("◆", actor: "tinker", message: "Patch applied: \(task.title)", level: .info)
+            case .verifying:
+                appendActivity("◎", actor: "inspector", message: "Verifying: \(task.title)", level: .progress)
+            case .merged, .cleaned:
+                appendActivity("✓", actor: "merge", message: "Merged: \(task.title)", level: .success)
+            case .rejected:
+                appendActivity("✗", actor: "merge", message: "Rejected: \(task.title)", level: .failure)
+            case .failed:
+                appendActivity("✗", actor: "tinker", message: "Failed: \(task.title) (retry \(task.retryCount)/\(task.maxRetries))", level: .failure)
+            default:
+                break
+            }
+        }
     }
 }
 
-// MARK: - Agent-manager style layout (Cursor/Codex-like)
+// MARK: - Worker pill
+
+private struct WorkerPill: View {
+    let name: String
+    let isActive: Bool
+    @State private var pulsing = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ZStack {
+                if isActive {
+                    Circle()
+                        .fill(Color.green.opacity(0.3))
+                        .frame(width: 14, height: 14)
+                        .scaleEffect(pulsing ? 1.8 : 1.0)
+                        .opacity(pulsing ? 0.0 : 0.7)
+                        .animation(.easeOut(duration: 1.2).repeatForever(autoreverses: false), value: pulsing)
+                }
+                Circle()
+                    .fill(isActive ? Color.green : Color.secondary.opacity(0.3))
+                    .frame(width: 8, height: 8)
+            }
+            Text(name)
+                .font(.system(size: 11, weight: isActive ? .semibold : .regular))
+                .foregroundStyle(isActive ? .primary : .secondary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(isActive ? Color.green.opacity(0.1) : Color.secondary.opacity(0.07)))
+        .onAppear { pulsing = isActive }
+        .onChange(of: isActive) { newValue in pulsing = newValue }
+    }
+}
+
+// MARK: - Main UI
 
 private struct ContentView: View {
     let appContainerPaths: AppContainerPaths?
     @StateObject private var model: AppViewModel
     @State private var showSettings = false
-    @State private var showEscalate = false
     @State private var showPDRPrompt = false
     @State private var showImportPlanSheet = false
     @State private var importPlanPastedText = ""
-    @State private var isAgentActivityAnimating = false
-
-    private var isContinueWorkingEnabled: Bool {
-        guard let run = model.runRecord else { return false }
-        // When a run is waiting for explicit user approval, do not allow "Continue Working"
-        // to start execution implicitly; the user should use "Confirm and Start" instead.
-        if run.state == .pendingApproval { return false }
-        let terminal: Set<TaskState> = [.merged, .rejected, .failed, .cleaned]
-        return model.tasks.contains { task in
-            if terminal.contains(task.state) { return false }
-            if task.state == .verifyFailedRetryable {
-                return task.retryCount < task.maxRetries
-            }
-            return true
-        }
-    }
-
-    /// Highlight "Continue Working" when there is an in-flight or resumable run so it is
-    /// obvious to the user how to pick up where the agent left off.
-    private var shouldEmphasizeContinueWorking: Bool {
-        guard isContinueWorkingEnabled, let run = model.runRecord else { return false }
-        switch run.state {
-        case .executing, .failed, .merging:
-            return true
-        default:
-            return false
-        }
-    }
-
-    /// Buttons to highlight because the failure explanation (or PDR/plan instructions) mentions them.
-    private var effectiveHighlightedButtonIDs: Set<String> {
-        var set = model.highlightedButtonIDs
-        if let exp = model.failureExplanation, isPDRRelatedFailure(exp) {
-            set.insert("editPDR")
-        }
-        if let exp = model.failureExplanation, isPlanRelatedFailure(exp) {
-            set.insert("viewPlan")
-        }
-        return set
-    }
 
     init(appContainerPaths: AppContainerPaths? = nil) {
         self.appContainerPaths = appContainerPaths
@@ -1092,804 +1166,274 @@ private struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-        } detail: {
-            mainContent
+        VStack(spacing: 0) {
+            workerRail
+            Divider()
+            HStack(alignment: .top, spacing: 20) {
+                primaryButtonPanel
+                activityFeedPanel
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            Divider()
+            composerSection
         }
-        .frame(minWidth: 1000, minHeight: 640)
-        .sheet(isPresented: $showSettings) {
-            SettingsView(paths: appContainerPaths)
-        }
-        .sheet(isPresented: $showEscalate) {
-            escalateSheet
-        }
+        .frame(minWidth: 720, minHeight: 480)
+        .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $showSettings) { SettingsView(paths: appContainerPaths) }
+        .sheet(isPresented: $showImportPlanSheet) { importPlanSheet }
         .sheet(isPresented: Binding(
             get: { model.shouldShowPDRPrompt || showPDRPrompt },
             set: { newValue in
                 showPDRPrompt = newValue
-                if !newValue {
-                    model.shouldShowPDRPrompt = false
-                }
+                if !newValue { model.shouldShowPDRPrompt = false }
             }
-        )) {
-            pdrPromptSheet
-        }
-        .sheet(isPresented: $showImportPlanSheet) {
-            importPlanSheet
-        }
+        )) { pdrPromptSheet }
         .onAppear { model.startMonitor() }
         .onDisappear { model.stopMonitor() }
     }
 
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Repo
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Workspace")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Text(model.repoURL.path)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-                HStack(spacing: 6) {
-                    Button(model.hasChosenRepository ? "Change…" : "Choose Workspace…") { model.chooseRepository() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                    Button("Refresh") { model.reloadAll() }
-                        .buttonStyle(.borderless)
-                        .controlSize(.small)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+    // MARK: Worker Rail
 
-            // Build system picker
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Build System")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Picker("Build system", selection: $model.buildSystemMode) {
-                    Text("Automatic").tag("auto")
-                    Text("Plan only (no build)").tag("none")
-                    Text("Swift Package (swift build)").tag("spm")
-                    Text("Xcode (xcodebuild)").tag("xcodebuild")
-                }
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .leading)
-
-                if model.buildSystemMode == "xcodebuild" {
-                    if model.availableSchemes.isEmpty {
-                        Text("No schemes detected. Make sure an Xcode project exists.")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.tertiary)
-                    } else {
-                        Picker("Scheme", selection: Binding<String>(
-                            get: { model.selectedScheme ?? model.availableSchemes.first ?? "" },
-                            set: { model.selectedScheme = $0 }
-                        )) {
-                            ForEach(model.availableSchemes, id: \.self) { scheme in
-                                Text(scheme).tag(scheme)
-                            }
-                        }
-                        .labelsHidden()
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
-
-            if let config = model.currentConfig {
-                Divider()
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Agents")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text("Mayor (planner): \(config.models.mayor)")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text("Tinkers (workers): \(config.models.tinker)")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(config.shouldUseOllama ? "Engine: Ollama" : "Engine: Local defaults")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            }
-
-            Divider()
-
-            // Preflight (compact)
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Environment")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                    HStack(spacing: 4) {
-                        ForEach(model.preflightChecks) { check in
-                            StatusBadge(ok: check.ok)
-                        }
-                    }
-                }
-                if !model.preflightChecks.allSatisfy(\.ok) {
-                    ForEach(model.preflightChecks.filter { !$0.ok }) { check in
-                        Text("\(check.name): \(check.detail)")
-                            .font(.system(size: 10))
-                            .foregroundStyle(.secondary)
-                    }
-                    if model.preflightChecks.contains(where: { $0.name == "ollama service" && !$0.ok }) {
-                        Button("Start Ollama") { model.startOllamaInTerminal() }
-                            .font(.system(size: 11))
-                            .buttonStyle(.borderedProminent)
-                    }
-                }
-                if effectiveHighlightedButtonIDs.contains("editPDR") {
-                    Button("Edit Product Design Requirement…") { model.editOrCreatePDR() }
-                        .font(.system(size: 11))
-                        .buttonStyle(.borderedProminent)
-                } else {
-                    Button("Edit Product Design Requirement…") { model.editOrCreatePDR() }
-                        .font(.system(size: 11))
-                        .buttonStyle(.borderless)
-                }
-                if effectiveHighlightedButtonIDs.contains("viewPlan") {
-                    Button("View Plan") { model.openOrCreatePlan() }
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.regular)
-                } else {
-                    Button("View Plan") { model.openOrCreatePlan() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
-                }
-                Button("Import Project Plan…") {
-                    importPlanPastedText = ""
-                    showImportPlanSheet = true
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.regular)
-                if !model.planChecklist.isEmpty {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("Checklist")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                        ForEach(model.planChecklist.prefix(5)) { item in
-                            HStack(spacing: 4) {
-                                Image(systemName: item.completed ? "checkmark.circle.fill" : "circle")
-                                    .foregroundColor(item.completed ? .green : .secondary)
-                                    .font(.system(size: 9))
-                                Text(item.title)
-                                    .font(.system(size: 10))
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                if !item.completed {
-                                    Spacer(minLength: 2)
-                                    Button("Run this step") {
-                                        model.runWithRequest("Focus on the next items from the project plan checklist in plan/PROJECT_PLAN.md: \(item.title).")
-                                    }
-                                    .buttonStyle(.borderless)
-                                    .controlSize(.mini)
-                                    .font(.system(size: 9))
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-
-            Divider()
-
-            // Runs (conversation history style)
-            VStack(alignment: .leading, spacing: 4) {
-                HStack {
-                    Text("Runs")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    if let latest = model.runs.first {
-                        Text("Latest: \(latest)")
-                            .font(.system(size: 10, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.top, 8)
-                List(model.runs, id: \.self, selection: $model.selectedRunID) { runID in
-                    HStack(spacing: 6) {
-                        if runID == model.runs.first {
-                            Text("●")
-                                .font(.system(size: 8))
-                                .foregroundStyle(.blue)
-                                .help("Most recent run")
-                        } else {
-                            Text("  ")
-                                .font(.system(size: 8))
-                        }
-                        Text(runID)
-                            .font(.system(size: 12, design: .monospaced))
-                    }
-                    .tag(runID)
-                }
-                .listStyle(.sidebar)
-            }
-
-            Spacer(minLength: 0)
-
-            Divider()
-            Button("Settings…") { showSettings = true }
-                .buttonStyle(.plain)
-                .padding(12)
-        }
-        .frame(minWidth: 220, idealWidth: 260)
-        .onChange(of: model.selectedRunID) { newValue in
-            model.selectRun(newValue)
-        }
-    }
-
-    private var mainContent: some View {
-        VStack(spacing: 0) {
-            // Top: status bar
-            HStack {
-                if model.isBusy {
-                    ProgressView()
-                        .scaleEffect(0.7)
-                    Text("Running…")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(model.statusMessage)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.secondary)
-                }
-                if let error = model.errorMessage {
-                    Text(error)
-                        .font(.system(size: 12))
-                        .foregroundStyle(.red)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Spacer()
-                if model.selectedRunID != nil {
-                    HStack(spacing: 8) {
-                        if model.isBusy {
-                            Button("Stop") { model.stopRun() }
-                                .controlSize(.small)
-                                .keyboardShortcut(".", modifiers: .command)
-                        }
-                        if shouldEmphasizeContinueWorking || effectiveHighlightedButtonIDs.contains("continueWorking") {
-                            Button("Continue Working") { model.continueWorking() }
-                                .disabled(!isContinueWorkingEnabled || model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderedProminent)
-                        } else {
-                            Button("Continue Working") { model.continueWorking() }
-                                .disabled(!isContinueWorkingEnabled || model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderless)
-                        }
-                        if effectiveHighlightedButtonIDs.contains("retryTask") {
-                            Button("Retry Task") { model.retrySelectedTask() }
-                                .disabled(model.selectedTaskID == nil || model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderedProminent)
-                        } else {
-                            Button("Retry Task") { model.retrySelectedTask() }
-                                .disabled(model.selectedTaskID == nil || model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderless)
-                        }
-                        if effectiveHighlightedButtonIDs.contains("cleanupRun") {
-                            Button("Cleanup Run") { model.cleanupSelectedRun() }
-                                .disabled(model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderedProminent)
-                        } else {
-                            Button("Cleanup Run") { model.cleanupSelectedRun() }
-                                .disabled(model.isBusy)
-                                .controlSize(.small)
-                                .buttonStyle(.borderless)
-                        }
-                    }
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            Divider()
-
-            // Center: run context + task list + logs (scrollable)
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if let run = model.runRecord {
-                        runHeader(run, tasks: model.tasks)
-                        agentActivitySection(run: run, tasks: model.tasks)
-                        taskPickerAndList
-                        logsSection
-                    } else {
-                        emptyState
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(16)
-            }
-            .background(Color(nsColor: .textBackgroundColor))
-
-            Divider()
-
-            // Bottom: composer-style input (agent manager style)
-            composerBar
-        }
-    }
-
-    private func runHeader(_ run: RunRecord, tasks: [TaskRecord]) -> some View {
-        let progress = GoalProgressService().progress(run: run, tasks: tasks)
-        return VStack(alignment: .leading, spacing: 6) {
-            Text(run.request)
-                .font(.system(size: 13))
-                .textSelection(.enabled)
-            HStack(spacing: 12) {
-                Text(run.state.rawValue)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text("Tasks: \(run.metrics.tasksTotal) · Merged: \(run.metrics.tasksMerged) · Failed: \(run.metrics.tasksFailed)")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            }
-            if run.state == .pendingApproval {
-                HStack(spacing: 8) {
-                    Image(systemName: "exclamationmark.circle.fill")
-                        .foregroundColor(.yellow)
-                        .font(.system(size: 12))
-                    Text("Awaiting your approval. Review the planned tasks below, uncheck any you don’t want to run, then click “Confirm and Start” at the bottom to begin execution.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-            }
-            // Goal/spec progress (G1)
-            HStack(spacing: 8) {
-                Text("Progress")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(String(format: "%.0f%%", progress.progressPercent * 100))
-                    .font(.system(size: 11, weight: .medium))
-                Text("· \(progress.goalsCompleted)/\(progress.goalsTotal) goals")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
-            }
-            // Goal checklist derived from GoalProgressItem (G1)
-            if !progress.items.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(progress.items, id: \.goalId) { item in
-                        HStack(spacing: 8) {
-                            Image(systemName: item.completed ? "checkmark.circle.fill" : "circle")
-                                .foregroundColor(item.completed ? .green : .secondary)
-                                .font(.system(size: 11))
-                            Text(item.title)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                                .truncationMode(.tail)
-                            Spacer()
-                            Text("\(item.completedCount)/\(max(1, item.taskCount)) tasks")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                }
-            }
-
-            // Simple "what now" guidance so users understand the next action after a run.
-            if run.state == .completed || run.state == .failed {
-                Divider()
-                    .padding(.vertical, 4)
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("What you should do next")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    if run.state == .completed {
-                        Text("Review the plan and checklist in plan/PROJECT_PLAN.md, then either click “Run Mayor on Plan” to continue implementation or type a new request describing your next goal.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                    } else if run.state == .failed {
-                        Text("Inspect the failing task’s logs below, update your project plan or workspace inputs if needed, then use “Retry Task” or “Continue Working” when there is additional work for TinkerTown to perform.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-            }
-
-            // Surface the exact next step from the plan with a one-tap "Run this step" button.
-            if let first = model.suggestedNextSteps.first {
-                Divider()
-                    .padding(.vertical, 4)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Next step")
-                        .font(.system(size: 11, weight: .semibold))
-                        .foregroundStyle(.secondary)
-                    Text(first.title)
-                        .font(.system(size: 11))
-                        .foregroundStyle(.primary)
-                        .lineLimit(2)
-                        .truncationMode(.tail)
-                    Button("Run this step") {
-                        model.runWithRequest(first.requestText)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
-                    .disabled(model.isBusy)
-                }
-            }
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    /// G2: Show which agent role is doing what (from task currentActorRole/currentActivity).
-    @ViewBuilder
-    private func agentActivitySection(run: RunRecord, tasks: [TaskRecord]) -> some View {
-        let inProgress = tasks.filter { t in
-            switch t.state {
-            case .worktreeReady, .prompted, .patchApplied, .verifying, .verifyFailedRetryable, .mergeReady: return true
+    private var workerSlots: [(name: String, isActive: Bool, activity: String?)] {
+        let maxParallel = model.currentConfig?.orchestrator.maxParallelTasks ?? 2
+        let activeTasks = model.tasks.filter {
+            switch $0.state {
+            case .worktreeReady, .prompted, .patchApplied, .verifying, .verifyFailedRetryable, .mergeReady:
+                return true
             default: return false
             }
         }
-        let lines: [(String, String)] = inProgress.compactMap { t in
-            let role = t.currentActorRole ?? "worker"
-            let activity = t.currentActivity ?? t.state.rawValue
-            return ("\(role.capitalized): \(t.taskID)", activity)
-        }
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Activity")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-            if lines.isEmpty {
-                let role = run.state == .planning ? "Planner" : "Orchestrator"
-                Text("\(role): idle")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary)
+        let mayorActive = model.isBusy && activeTasks.isEmpty
+        var slots: [(name: String, isActive: Bool, activity: String?)] = [
+            ("Mayor", mayorActive, mayorActive ? "planning…" : nil)
+        ]
+        for i in 0..<maxParallel {
+            if i < activeTasks.count {
+                let task = activeTasks[i]
+                slots.append(("Tinker \(i + 1)", true, task.currentActivity ?? task.state.rawValue))
             } else {
-                HStack(spacing: 6) {
-                    Image(systemName: "sparkles")
-                        .rotationEffect(.degrees(isAgentActivityAnimating ? 360 : 0))
-                        .animation(.linear(duration: 1.5).repeatForever(autoreverses: false), value: isAgentActivityAnimating)
-                        .foregroundStyle(Color.accentColor)
-                    Text("Agents are actively working…")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                }
-                .onAppear { isAgentActivityAnimating = true }
-                .onDisappear { isAgentActivityAnimating = false }
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, pair in
-                    HStack(spacing: 8) {
-                        Text(pair.0)
-                            .font(.system(size: 11, weight: .medium))
-                        Text("—")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                        Text(pair.1)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.tertiary)
-                    }
-                }
+                slots.append(("Tinker \(i + 1)", false, nil))
             }
         }
-        .padding(8)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.6))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        return slots
     }
 
-    private var taskPickerAndList: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("Tasks")
-                    .font(.system(size: 12, weight: .semibold))
+    private var workerRail: some View {
+        HStack(spacing: 10) {
+            ForEach(Array(workerSlots.enumerated()), id: \.offset) { _, slot in
+                WorkerPill(name: slot.name, isActive: slot.isActive)
+                    .help(slot.activity ?? (slot.isActive ? "Active" : "Idle"))
+            }
+            Spacer()
+            Button { showSettings = true } label: {
+                Image(systemName: "gear")
                     .foregroundStyle(.secondary)
-                Picker("Task", selection: $model.selectedTaskID) {
-                    Text("Run events").tag(String?.none)
-                    ForEach(model.tasks, id: \.taskID) { task in
-                        Text(task.taskID).tag(Optional(task.taskID))
-                    }
-                }
-                .labelsHidden()
-                .frame(maxWidth: 200)
-                .onChange(of: model.selectedTaskID) { newValue in
-                    model.selectTask(newValue)
-                }
             }
-            if !model.tasks.isEmpty {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(model.tasks, id: \.taskID) { task in
-                        HStack(spacing: 12) {
-                            if model.runRecord?.state == .pendingApproval {
-                                Toggle(
-                                    "",
-                                    isOn: Binding(
-                                        get: { model.approvedTaskIDs.contains(task.taskID) },
-                                        set: { isOn in
-                                            if isOn { model.approvedTaskIDs.insert(task.taskID) }
-                                            else { model.approvedTaskIDs.remove(task.taskID) }
-                                        }
-                                    )
-                                )
-                                .toggleStyle(.checkbox)
-                            }
-                            StatusBadge(ok: task.state != .failed)
-                            Text(task.taskID)
-                                .font(.system(size: 11, design: .monospaced))
-                            Text(task.title)
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                            Spacer()
-                            Text("\(task.state.rawValue) · retry \(task.retryCount)/\(task.maxRetries)")
-                                .font(.system(size: 10))
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 4)
-                        .padding(.horizontal, 8)
-                        .background(model.selectedTaskID == task.taskID ? Color.accentColor.opacity(0.15) : Color.clear)
-                        .clipShape(RoundedRectangle(cornerRadius: 4))
-                    }
-                }
-            }
+            .buttonStyle(.plain)
+            .padding(.trailing, 4)
         }
-    }
-
-    /// True when the failure explanation mentions PDR/plan/requirements so we can show clear "what to provide" steps.
-    private func isPDRRelatedFailure(_ explanation: String) -> Bool {
-        let lower = explanation.localizedLowercase
-        return lower.contains("pdr") || lower.contains("product design requirement")
-            || (lower.contains("incomplete") && lower.contains("requirement")) || lower.contains("plan") && lower.contains("prd")
-    }
-
-    /// True when the failure explanation or logs clearly point at problems in plan/PROJECT_PLAN.md.
-    private func isPlanRelatedFailure(_ explanation: String) -> Bool {
-        let lower = explanation.localizedLowercase
-        return lower.contains("project plan") || lower.contains("plan/project_plan.md")
-            || (lower.contains("undefined variable") && lower.contains("plan"))
-    }
-
-    private func isWorkspaceRelatedFailure(_ explanation: String) -> Bool {
-        let lower = explanation.localizedLowercase
-        return lower.contains("workspace") && (lower.contains("configuration") || lower.contains("config") || lower.contains("necessary files"))
-            || lower.contains("fix workspace")
-    }
-
-    private var pdrInstructionsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("What to provide")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.primary)
-            Text("The Product Design Requirement (PDR) tells the Mayor what to build. It lives in your workspace at .tinkertown/pdr.json.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("1. Click “Edit Product Design Requirement…” in the left sidebar to open the PDR file.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("2. Fill in at least: Title (project name), Summary (what the product does in a few sentences), Scope (what’s in and out of scope), and Acceptance criteria (testable conditions the product must meet).")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("3. Save the file, then run your request again or click “Run Mayor on Plan”.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            Button("Edit Product Design Requirement…") { model.editOrCreatePDR() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.08))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var logsSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let explanation = model.failureExplanation {
-                Text(explanation)
-                    .font(.system(size: 12))
-                    .foregroundStyle(.primary)
-                    .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
-                if isPDRRelatedFailure(explanation) {
-                    pdrInstructionsView
-                } else if isPlanRelatedFailure(explanation) {
-                    planInstructionsView
-                } else if isWorkspaceRelatedFailure(explanation) {
-                    workspaceInstructionsView
-                }
-            }
-            Text("Logs")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
-            TextEditor(text: .constant(model.logsText))
-                .font(.system(size: 11, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .frame(minHeight: 200, maxHeight: 400)
-                .padding(8)
-                .background(Color(nsColor: .windowBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-    }
-
-    /// Guided helper for fixing plan/PROJECT_PLAN.md when the agents complain about its configuration.
-    private var planInstructionsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Make the project plan usable")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.primary)
-            Text("The project plan in plan/PROJECT_PLAN.md is where you and the Mayor agree on concrete steps. When it contains unresolved variables or opaque placeholders, the agents cannot safely turn it into tasks.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            VStack(alignment: .leading, spacing: 4) {
-                Text("1. Click “View Plan” in the sidebar to open plan/PROJECT_PLAN.md.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("2. In the “Overview” section, write 2–4 sentences in plain English describing what you’re building and why.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("3. Under “Active Checklist (Mayor-owned)”, replace any template variables with a short list of real, concrete tasks, each on its own line using the form `- [ ] Do something specific`.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("4. Remove or edit any leftover placeholders like `${variable}` or `{{todo}}` so the file reads like normal Markdown.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Text("5. Save the file, then use “Run Mayor on Plan” to let the agents derive a fresh task plan from your updated checklist.")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-            }
-            Button("Open Project Plan…") { model.openOrCreatePlan() }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    /// When the agent reports invalid workspace/configuration, offer a one-tap fix so the agent can proceed on retry.
-    private var workspaceInstructionsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Fix workspace")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.primary)
-            Text("TinkerTown will ensure the project plan and PDR exist. Then retry the task or run again; verification will match this workspace (e.g. Node vs Swift) automatically.")
-                .font(.system(size: 11))
-                .foregroundStyle(.secondary)
-            Button("Fix workspace") {
-                model.fixWorkspace()
-            }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-        }
-        .padding(12)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.accentColor.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 12) {
-            Text("No run selected")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text("Click “Choose Workspace…” in the sidebar to select a git repo, then enter a task below and tap Run to start the agent.")
-                .font(.system(size: 12))
-                .foregroundStyle(.tertiary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 400)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 48)
-    }
-
-    private var composerBar: some View {
-        VStack(spacing: 0) {
-            HStack(alignment: .bottom, spacing: 12) {
-                TextField("Describe what you want the agent to do…", text: $model.requestText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 13))
-                    .lineLimit(1...6)
-                    .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor))
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                Button("Run") { model.runRequest() }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(model.isBusy)
-                    .buttonStyle(.borderedProminent)
-            }
-            .padding(12)
-            HStack {
-                Button("Escalate…") { showEscalate = true }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if model.runRecord?.state == .pendingApproval {
-                    if effectiveHighlightedButtonIDs.contains("confirmAndStart") {
-                        Button("Confirm and Start") { model.confirmAndStartExecution() }
-                            .disabled(model.isBusy)
-                            .buttonStyle(.borderedProminent)
-                    } else {
-                        Button("Confirm and Start") { model.confirmAndStartExecution() }
-                            .disabled(model.isBusy)
-                            .buttonStyle(.bordered)
-                    }
-                }
-                if effectiveHighlightedButtonIDs.contains("runMayorOnPlan") {
-                    Button("Run Mayor on Plan") { model.runMayorFromPlanChecklist() }
-                        .disabled(model.isBusy)
-                        .buttonStyle(.borderedProminent)
-                } else {
-                    Button("Run Mayor on Plan") { model.runMayorFromPlanChecklist() }
-                        .disabled(model.isBusy)
-                        .buttonStyle(.bordered)
-                }
-            }
-            .padding(.horizontal, 12)
-            .padding(.bottom, 8)
-        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 
-    private var escalateSheet: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Escalate")
-                .font(.headline)
-            HStack {
-                Picker("Severity", selection: $model.escalationSeverity) {
-                    Text("HIGH").tag("HIGH")
-                    Text("CRITICAL").tag("CRITICAL")
-                }
-                .frame(width: 140)
-            }
-            TextField("Message", text: $model.escalationMessage, axis: .vertical)
-                .textFieldStyle(.roundedBorder)
-                .lineLimit(3...8)
-            HStack {
-                Spacer()
-                Button("Cancel") { showEscalate = false }
-                Button("Log") {
-                    model.escalate()
-                    showEscalate = false
-                }
-                .disabled(model.isBusy)
-                .buttonStyle(.borderedProminent)
+    // MARK: Primary Button
+
+    private enum PrimaryAction {
+        case chooseWorkspace, startOllama, startRun, stop, approveAndStart, resume, newRun
+    }
+
+    private var primaryAction: PrimaryAction {
+        if !model.hasChosenRepository { return .chooseWorkspace }
+        if model.isBusy { return .stop }
+        if let run = model.runRecord {
+            switch run.state {
+            case .pendingApproval: return .approveAndStart
+            case .executing, .merging, .planning: return .stop
+            case .failed:
+                let terminal: Set<TaskState> = [.merged, .rejected, .failed, .cleaned]
+                return model.tasks.contains { !terminal.contains($0.state) } ? .resume : .newRun
+            case .completed: return .newRun
+            default: break
             }
         }
-        .padding(24)
-        .frame(width: 400)
+        let ollamaDown = model.preflightChecks.contains { $0.name == "ollama service" && !$0.ok }
+        return ollamaDown ? .startOllama : .startRun
     }
+
+    private var primaryButtonTitle: String {
+        switch primaryAction {
+        case .chooseWorkspace: return "Choose\nWorkspace"
+        case .startOllama:     return "Start\nOllama"
+        case .startRun:        return "Start\nRun"
+        case .stop:            return "Stop"
+        case .approveAndStart: return "Approve\n& Start"
+        case .resume:          return "Resume"
+        case .newRun:          return "New\nRun"
+        }
+    }
+
+    private var primaryButtonTint: Color {
+        switch primaryAction {
+        case .stop:   return .red
+        case .resume: return .orange
+        case .newRun: return Color(nsColor: .systemGray)
+        default:      return .accentColor
+        }
+    }
+
+    private func executePrimary() {
+        switch primaryAction {
+        case .chooseWorkspace: model.chooseRepository()
+        case .startOllama:     model.startOllamaInTerminal()
+        case .startRun:        model.runRequest()
+        case .stop:            model.stopRun()
+        case .approveAndStart: model.confirmAndStartExecution()
+        case .resume:          model.continueWorking()
+        case .newRun:          model.clearForNewRun()
+        }
+    }
+
+    private var primaryButtonPanel: some View {
+        VStack(spacing: 14) {
+            Button(action: executePrimary) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 16)
+                        .fill(primaryButtonTint)
+                    VStack(spacing: 10) {
+                        if model.isBusy {
+                            ProgressView()
+                                .scaleEffect(0.85)
+                                .tint(.white)
+                        }
+                        Text(primaryButtonTitle)
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                    }
+                    .padding(20)
+                }
+            }
+            .buttonStyle(.plain)
+            .frame(width: 180, height: 110)
+
+            if model.hasChosenRepository {
+                VStack(spacing: 3) {
+                    Text(model.repoURL.lastPathComponent)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    Button("Change workspace…") { model.chooseRepository() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            if let error = model.errorMessage {
+                Text(error)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 180)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(width: 180)
+    }
+
+    // MARK: Activity Feed
+
+    private var activityFeedPanel: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 6) {
+                    if model.activityFeed.isEmpty {
+                        Text(emptyFeedMessage)
+                            .font(.system(size: 12))
+                            .foregroundStyle(.tertiary)
+                            .padding(12)
+                    } else {
+                        ForEach(model.activityFeed) { entry in
+                            HStack(alignment: .top, spacing: 8) {
+                                Text(entry.icon)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(entry.iconColor)
+                                    .frame(width: 16)
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text(entry.actor.uppercased())
+                                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                        .foregroundStyle(.secondary)
+                                        .frame(minWidth: 60, alignment: .leading)
+                                    Text(entry.message)
+                                        .font(.system(size: 12))
+                                        .foregroundStyle(.primary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            .id(entry.id)
+                        }
+                        Color.clear.frame(height: 1).id("feedBottom")
+                    }
+                }
+                .padding(12)
+            }
+            .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+            .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+            .onChange(of: model.activityFeed.count) { _ in
+                withAnimation { proxy.scrollTo("feedBottom", anchor: .bottom) }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var emptyFeedMessage: String {
+        guard model.hasChosenRepository else { return "Choose a workspace to get started." }
+        return "No activity yet. Type a request below and tap Start Run."
+    }
+
+    // MARK: Composer
+
+    private var composerSection: some View {
+        HStack(alignment: .bottom, spacing: 12) {
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $model.requestText)
+                    .font(.system(size: 13))
+                    .frame(minHeight: 36, maxHeight: 140)
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                    .disabled(model.isBusy)
+                if model.requestText.isEmpty {
+                    Text("Describe a task, ask a question, or give the mayor instructions…")
+                        .font(.system(size: 13))
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 16)
+                        .allowsHitTesting(false)
+                }
+            }
+            Button("Send") { model.runRequest() }
+                .keyboardShortcut(.return, modifiers: .command)
+                .buttonStyle(.borderedProminent)
+                .disabled(model.isBusy || model.requestText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(Color(nsColor: .windowBackgroundColor))
+    }
+
+    // MARK: Sheets
 
     private var pdrPromptSheet: some View {
         VStack(alignment: .leading, spacing: 16) {
             Text("Attach Product Requirements")
                 .font(.headline)
-            Text("This workspace does not yet have a Product Design Requirement file at .tinkertown/pdr.json. TinkerTown needs one before the Mayor can reliably plan work.")
+            Text("This workspace does not yet have a Product Design Requirement file. TinkerTown needs one before the Mayor can reliably plan work.")
                 .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            Text("Paste or upload a project plan (TinkerTown will configure the PDR for you), or create a minimal PDR to edit.")
-                .font(.system(size: 11))
                 .foregroundStyle(.secondary)
             HStack {
                 Spacer()
@@ -1919,7 +1463,7 @@ private struct ContentView: View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Import Project Plan")
                 .font(.headline)
-            Text("Paste your project plan below or choose a file. TinkerTown will save it to plan/PROJECT_PLAN.md and configure the PDR so the Mayor and mirror can use it—no need to edit .tinkertown/pdr.json yourself.")
+            Text("Paste your project plan below or choose a file. TinkerTown will save it to plan/PROJECT_PLAN.md and configure the PDR.")
                 .font(.system(size: 12))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1952,8 +1496,8 @@ private struct ContentView: View {
         .padding(24)
         .frame(width: 560, height: 480)
     }
-}
 
+}
 @main
 struct TinkerTownAppMain: App {
     private static let appContainerPaths: AppContainerPaths = {
