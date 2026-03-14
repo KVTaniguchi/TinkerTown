@@ -12,6 +12,8 @@
 		AA0003 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0003 /* SettingsView.swift */; };
 		AA0004 /* ModelManagementView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0004 /* ModelManagementView.swift */; };
 		AA0005 /* TinkerTownCore in Frameworks */ = {isa = PBXBuildFile; productRef = CC0001 /* TinkerTownCore */; };
+		AA0006 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = BB0005 /* Assets.xcassets */; };
+		AA0007 /* AppLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB0006 /* AppLogger.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -20,6 +22,8 @@
 		BB0002 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
 		BB0003 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		BB0004 /* ModelManagementView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ModelManagementView.swift; sourceTree = "<group>"; };
+		BB0005 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		BB0006 /* AppLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLogger.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -45,7 +49,9 @@
 		EE0001 /* TinkerTownApp */ = {
 			isa = PBXGroup;
 			children = (
+				BB0005 /* Assets.xcassets */,
 				BB0001 /* TinkerTownApp.swift */,
+				BB0006 /* AppLogger.swift */,
 				EE0004 /* Onboarding */,
 				EE0005 /* Settings */,
 			);
@@ -141,6 +147,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AA0006 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -155,6 +162,7 @@
 				AA0002 /* OnboardingView.swift in Sources */,
 				AA0003 /* SettingsView.swift in Sources */,
 				AA0004 /* ModelManagementView.swift in Sources */,
+				AA0007 /* AppLogger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
