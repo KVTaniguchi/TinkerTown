@@ -79,6 +79,25 @@ private final class AppViewModel: ObservableObject {
     @Published var highlightedButtonIDs: Set<String> = []
     @Published var activityFeed: [ActivityFeedEntry] = []
 
+    // MARK: Autopilot
+    @Published var autopilotEnabled: Bool = UserDefaults.standard.bool(forKey: "autopilot.enabled") {
+        didSet {
+            UserDefaults.standard.set(autopilotEnabled, forKey: "autopilot.enabled")
+            if autopilotEnabled { startAutopilotTimer() } else { stopAutopilotTimer() }
+        }
+    }
+    @Published var autopilotIntervalHours: Double = {
+        let v = UserDefaults.standard.double(forKey: "autopilot.intervalHours")
+        return v > 0 ? v : 4.0
+    }() {
+        didSet {
+            UserDefaults.standard.set(autopilotIntervalHours, forKey: "autopilot.intervalHours")
+            if autopilotEnabled { startAutopilotTimer() }
+        }
+    }
+    @Published var nextAutopilotFireDate: Date?
+    private var autopilotTimer: Timer?
+
     private let appContainerPaths: AppContainerPaths?
     private var seenTaskStates: [String: TaskState] = [:]
     /// G3: Timer for live UI updates while orchestration runs in background.
@@ -114,6 +133,7 @@ private final class AppViewModel: ObservableObject {
             selectedTaskID = nil
             inspectWorkspaceAndReload()
             startMonitor()
+            if autopilotEnabled { startAutopilotTimer() }
         }
     }
 
@@ -252,6 +272,65 @@ private final class AppViewModel: ObservableObject {
         return text
     }
 
+    // MARK: Autopilot timer
+
+    func startAutopilotTimer() {
+        stopAutopilotTimer()
+        guard hasChosenRepository else { return }
+        let interval = autopilotIntervalHours * 3600
+        nextAutopilotFireDate = Date().addingTimeInterval(interval)
+        autopilotTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isBusy else { return }
+                self.nextAutopilotFireDate = Date().addingTimeInterval(self.autopilotIntervalHours * 3600)
+                self.appendActivity("⏰", actor: "autopilot", message: "Autopilot: starting scheduled run", level: .info)
+                self.runMayorFromPlanChecklist()
+            }
+        }
+    }
+
+    func stopAutopilotTimer() {
+        autopilotTimer?.invalidate()
+        autopilotTimer = nil
+        nextAutopilotFireDate = nil
+    }
+
+    /// Opens plan/PROJECT_PLAN.md in the default editor (e.g. TextEdit, VS Code, etc.).
+    /// Creates a default plan template first if the file doesn't exist.
+    func openPlanFile() {
+        guard hasChosenRepository else { return }
+        let planURL = repoURL
+            .appendingPathComponent("plan", isDirectory: true)
+            .appendingPathComponent("PROJECT_PLAN.md")
+        if !FileManager.default.fileExists(atPath: planURL.path) {
+            try? FileManager.default.createDirectory(
+                at: planURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+            let title = repoURL.lastPathComponent
+            let template = """
+            # Project Plan – \(title)
+
+            ## Overview
+            Briefly restate the project scope and goals here.
+
+            ## Active Checklist (Mayor-owned)
+            - [ ] First concrete task derived from the product requirements
+
+            ## Backlog (Mayor-owned)
+            - [ ] Future task or idea to consider
+
+            ## Decisions Log (Mayor-owned)
+            - \(ISO8601DateFormatter().string(from: Date()).prefix(10)): Document major decisions here.
+
+            ## Risks / Unknowns (Mayor-owned)
+            - Describe known risks or open questions.
+            """
+            try? template.write(to: planURL, atomically: true, encoding: .utf8)
+        }
+        NSWorkspace.shared.open(planURL)
+    }
+
     /// Starts the Ollama server in a new Terminal window. Call when ollama service is unavailable.
     func startOllamaInTerminal() {
         let proc = Process()
@@ -265,69 +344,10 @@ private final class AppViewModel: ObservableObject {
         }
     }
 
-    /// Plans from the checklist and then executes in one background flow so the user is not
-    /// prompted to "Confirm and Start" unless they explicitly open a run already in PENDING_APPROVAL.
+    /// Starts a run driven by the project plan. The Mayor reads PROJECT_PLAN.md directly
+    /// and derives tasks from it, so no checklist pre-processing is needed here.
     func runMayorFromPlanChecklist() {
-        runOrchestrationInBackground { [repoURL] in
-            let context = try self.makeContext(root: repoURL)
-            try Self.ensureGitPreflight(cwd: repoURL)
-
-            let planning = PlanningService(paths: context.paths)
-            let title = repoURL.lastPathComponent.isEmpty ? "My project" : repoURL.lastPathComponent
-            _ = try planning.ensureDefaultPlanExists(title: title)
-            let checklist = planning.loadChecklistItems()
-            DispatchQueue.main.sync {
-                self.planChecklist = checklist.map { PlanChecklistRow(title: $0.title, completed: $0.completed) }
-            }
-
-            let summary: String
-            if checklist.isEmpty {
-                summary = "Use the project plan document (plan/PROJECT_PLAN.md) to derive an initial task plan and start work."
-            } else {
-                let pending = checklist.filter { !$0.completed }.map(\.title)
-                if pending.isEmpty {
-                    summary = "The checklist in plan/PROJECT_PLAN.md is fully completed. Review for any follow-ups or refinements that improve quality or robustness."
-                } else {
-                    let joined = pending.joined(separator: "; ")
-                    summary = "Focus on the next items from the project plan checklist in plan/PROJECT_PLAN.md: \(joined)."
-                }
-            }
-
-            let pdrService = PDRService(paths: context.paths)
-            let (pdr, resolvedURL) = try pdrService.resolve(customPath: nil)
-            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails)
-            let orchestrator = Orchestrator(
-                root: repoURL,
-                paths: context.paths,
-                config: context.config,
-                store: context.store,
-                events: context.events,
-                worktrees: WorktreeManager(),
-                inspector: context.inspector,
-                scheduler: Scheduler(),
-                mergeManager: DefaultMergeManager(root: repoURL, store: context.store),
-                mayor: adapters.mayor,
-                tinker: adapters.tinker
-            )
-            let runID = try orchestrator.generatePlan(request: summary, pdr: pdr, pdrResolvedURL: resolvedURL, skipApproval: true)
-            let runIDs = try context.store.listRuns().sorted(by: >)
-            let run = try context.store.loadRun(runID)
-            let taskList = try context.store.listTasks(runID: runID)
-            let logs = try Self.readRunLogs(paths: context.paths, runID: runID)
-            DispatchQueue.main.sync {
-                self.currentConfig = context.config
-                self.runs = runIDs
-                self.selectedRunID = runID
-                self.runRecord = run
-                self.tasks = taskList
-                self.approvedTaskIDs = Set(taskList.map(\.taskID))
-                self.selectedTaskID = taskList.first?.taskID
-                self.logsText = logs
-                self.preflightChecks = (try? Self.preflightChecks(root: repoURL, config: context.config)) ?? []
-                self.updateFailureExplanationIfNeeded(runID: runID, taskID: self.selectedTaskID, logs: logs)
-            }
-            try orchestrator.execute(runID: runID, approvedTaskIDs: nil)
-        }
+        runWithRequest("Follow the project plan.")
     }
 
     func runRequest() {
@@ -352,7 +372,8 @@ private final class AppViewModel: ObservableObject {
             try Self.ensureGitPreflight(cwd: repoURL)
             let pdrService = PDRService(paths: context.paths)
             let (pdr, resolvedURL) = try pdrService.resolve(customPath: nil)
-            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails)
+            let wsLogger = WorkspaceLogger(root: repoURL)
+            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails, logger: wsLogger)
             let orchestrator = Orchestrator(
                 root: repoURL,
                 paths: context.paths,
@@ -364,7 +385,8 @@ private final class AppViewModel: ObservableObject {
                 scheduler: Scheduler(),
                 mergeManager: DefaultMergeManager(root: repoURL, store: context.store),
                 mayor: adapters.mayor,
-                tinker: adapters.tinker
+                tinker: adapters.tinker,
+                logger: wsLogger
             )
             let runID = try orchestrator.generatePlan(request: trimmed, pdr: pdr, pdrResolvedURL: resolvedURL, skipApproval: true)
             let runIDs = try context.store.listRuns().sorted(by: >)
@@ -394,7 +416,8 @@ private final class AppViewModel: ObservableObject {
         }
         runOrchestrationInBackground { [repoURL] in
             let context = try self.makeContext(root: repoURL)
-            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails)
+            let wsLogger = WorkspaceLogger(root: repoURL)
+            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails, logger: wsLogger)
             let orchestrator = Orchestrator(
                 root: repoURL,
                 paths: context.paths,
@@ -406,7 +429,8 @@ private final class AppViewModel: ObservableObject {
                 scheduler: Scheduler(),
                 mergeManager: DefaultMergeManager(root: repoURL, store: context.store),
                 mayor: adapters.mayor,
-                tinker: adapters.tinker
+                tinker: adapters.tinker,
+                logger: wsLogger
             )
             try orchestrator.resume(runID: runID)
         }
@@ -420,7 +444,8 @@ private final class AppViewModel: ObservableObject {
         let approved = approvedTaskIDs
         runOrchestrationInBackground { [repoURL] in
             let context = try self.makeContext(root: repoURL)
-            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails)
+            let wsLogger = WorkspaceLogger(root: repoURL)
+            let adapters = Self.makeAdapters(config: context.config, guardrails: context.guardrails, logger: wsLogger)
             let orchestrator = Orchestrator(
                 root: repoURL,
                 paths: context.paths,
@@ -432,7 +457,8 @@ private final class AppViewModel: ObservableObject {
                 scheduler: Scheduler(),
                 mergeManager: DefaultMergeManager(root: repoURL, store: context.store),
                 mayor: adapters.mayor,
-                tinker: adapters.tinker
+                tinker: adapters.tinker,
+                logger: wsLogger
             )
             let approvedList = approved.isEmpty ? nil : Array(approved)
             try orchestrator.execute(runID: runID, approvedTaskIDs: approvedList)
@@ -883,11 +909,11 @@ private final class AppViewModel: ObservableObject {
         }
     }
 
-    private static func makeAdapters(config: AppConfig, guardrails: GuardrailService) -> (mayor: MayorAdapting, tinker: TinkerAdapting) {
+    private static func makeAdapters(config: AppConfig, guardrails: GuardrailService, logger: WorkspaceLogger?) -> (mayor: MayorAdapting, tinker: TinkerAdapting) {
         if config.shouldUseOllama {
             let client = OllamaClient()
-            let mayor = OllamaMayorAdapter(client: client, model: config.models.mayor, numCtx: config.ollama.mayorNumCtx)
-            let tinker = OllamaTinkerAdapter(client: client, model: config.models.tinker, numCtx: config.ollama.tinkerNumCtx, guardrails: guardrails)
+            let mayor = OllamaMayorAdapter(client: client, model: config.models.mayor, numCtx: config.ollama.mayorNumCtx, logger: logger)
+            let tinker = OllamaTinkerAdapter(client: client, model: config.models.tinker, numCtx: config.ollama.tinkerNumCtx, guardrails: guardrails, logger: logger)
             return (mayor, tinker)
         }
         return (DefaultMayorAdapter(), DefaultTinkerAdapter(guardrails: guardrails))
@@ -1297,6 +1323,56 @@ private struct ContentView: View {
         }
     }
 
+    private var autopilotRow: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                Toggle("", isOn: $model.autopilotEnabled)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .scaleEffect(0.75, anchor: .leading)
+                    .frame(width: 38)
+                Text("Autopilot")
+                    .font(.system(size: 12, weight: .medium))
+                Spacer()
+                if model.autopilotEnabled {
+                    Picker("", selection: $model.autopilotIntervalHours) {
+                        Text("1h").tag(1.0)
+                        Text("2h").tag(2.0)
+                        Text("4h").tag(4.0)
+                        Text("8h").tag(8.0)
+                        Text("24h").tag(24.0)
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .font(.system(size: 11))
+                    .frame(width: 52)
+                }
+            }
+            if model.autopilotEnabled, let next = model.nextAutopilotFireDate {
+                Text("Next run \(next, style: .relative) from now")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 44)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(model.autopilotEnabled
+                    ? Color.accentColor.opacity(0.08)
+                    : Color(nsColor: .controlBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(model.autopilotEnabled
+                    ? Color.accentColor.opacity(0.3)
+                    : Color(nsColor: .separatorColor),
+                    lineWidth: 1)
+        )
+        .frame(width: 180)
+    }
+
     private var primaryButtonPanel: some View {
         VStack(spacing: 14) {
             Button(action: executePrimary) {
@@ -1321,6 +1397,22 @@ private struct ContentView: View {
             .frame(width: 180, height: 110)
 
             if model.hasChosenRepository {
+                Button(action: model.openPlanFile) {
+                    Label("View Plan", systemImage: "doc.text")
+                        .font(.system(size: 13, weight: .medium))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 7)
+                        .background(Color(nsColor: .controlBackgroundColor))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(nsColor: .separatorColor), lineWidth: 1))
+                }
+                .buttonStyle(.plain)
+                .frame(width: 180)
+            }
+
+            if model.hasChosenRepository {
+                autopilotRow
+
                 VStack(spacing: 3) {
                     Text(model.repoURL.lastPathComponent)
                         .font(.system(size: 12, weight: .medium))

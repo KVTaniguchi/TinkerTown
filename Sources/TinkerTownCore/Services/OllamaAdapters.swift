@@ -16,53 +16,88 @@ public struct OllamaMayorAdapter: MayorAdapting {
     private let model: String
     private let numCtx: Int
     private let fallback: MayorAdapting
+    public var logger: WorkspaceLogger?
 
-    public init(client: OllamaClient = OllamaClient(), model: String, numCtx: Int, fallback: MayorAdapting = DefaultMayorAdapter()) {
+    public init(client: OllamaClient = OllamaClient(), model: String, numCtx: Int, fallback: MayorAdapting = DefaultMayorAdapter(), logger: WorkspaceLogger? = nil) {
         self.client = client
         self.model = model
         self.numCtx = numCtx
         self.fallback = fallback
+        self.logger = logger
     }
 
-    public func plan(pdr: PDRRecord, request: String) -> [PlannedTask] {
+    public func plan(pdr: PDRRecord, request: String, planContent: String? = nil) -> [PlannedTask] {
+        let hasPlan = planContent != nil
         let system = """
         You are a task planner for a multi-component software system. The goal is to produce tasks that result in real application code being built—not documentation.
+        \(hasPlan ? """
+
+        A PROJECT_PLAN.md has been provided. This plan is the authoritative source of truth for what needs to be built. Your primary job is to decompose the plan's active checklist items into concrete coding tasks. Use the PDR for scope and constraints; use the project plan for the specific work items to implement now.
+        """ : """
 
         You are given a Product Design Requirement (PDR) and an optional user request. Use the PDR for scope and acceptance criteria; use the request to focus the current run.
-        Output a JSON array of tasks. Each task must have:
+        """)
+        CRITICAL OUTPUT RULE: Your entire response MUST be a single raw JSON array. It MUST start with '[' and end with ']'. Do NOT include any prose, explanation, preamble, markdown fences, or text outside the array. If you include anything other than the JSON array your output will be discarded and no work will be done.
+
+        Each task object in the array must have:
         - "title" (string)
         - "priority" (1-3, 1 highest)
-        - "depends_on" (array of task titles or empty)
-        - "target_files" (array of file paths that the worker will edit or create)
-        Optional fields (strongly recommended):
-        - "component_kind" (string, e.g. "backend_api", "web_app", "ios_app")
-        - "component_id" (string shared by tasks in the same component)
-        - "verification_command" (string, e.g. "npm test", "swift build", "true"). When target_files are all under one directory (e.g. backend/), verification runs from that directory—use "npm start" or "npm test", not "cd backend && ...".
+        - "depends_on" (array of task titles, or [])
+        - "target_files" (array of actual source file paths the worker will edit or create — REQUIRED, must not be empty)
+        Recommended fields:
+        - "component_kind" (e.g. "backend_api", "frontend_web", "ios_app")
+        - "component_id" (shared identifier for tasks in the same component)
+        - "verification_command" (e.g. "npm test", "node -e 'require(\\\"./server\\\")'", "true"). When all target_files are under one directory (e.g. backend/), verification runs FROM that directory — use relative commands like "node server.js", not "cd backend && node server.js".
 
-        target_files: Use real source/config paths the implementation will touch. Examples: "backend/server.js", "package.json", "frontend/src/App.jsx", "api/task-schema.json", "db/schema.sql". Only use "tinkertown-task-notes.md" for meta or documentation-only tasks. Prefer concrete paths (e.g. server.js, package.json, src/App.jsx) so the coding agent writes application code, not notes.
+        target_files rules: Use real source/config paths. Examples: "backend/server.js", "backend/package.json", "frontend/src/App.jsx", "frontend/index.html", "db/schema.sql". NEVER use "tinkertown-task-notes.md" — it signals a planning failure.
 
-        When the user describes multiple components (backend, frontend, etc.), create at least one task per component, set component_kind and component_id, and use depends_on so dependencies are ordered. Ensure target_files point at the actual files that implement the feature.
+        When the project has multiple components (backend, frontend, etc.) create one task per component, set component_kind/component_id, and use depends_on to order them.
 
-        Output only valid JSON, no markdown or explanation.
+        REMINDER: Output ONLY the JSON array starting with '['. No other text.
         """
-        let prompt = """
-        PDR context:
-        \(pdr.contextSummary)
+        let prompt: String
+        if let plan = planContent {
+            prompt = """
+            PROJECT_PLAN.md (authoritative — derive tasks from the active checklist items):
+            \(plan)
 
-        User request: \(request.isEmpty ? pdr.title : request)
+            PDR context (scope and constraints):
+            \(pdr.contextSummary)
 
-        JSON array of tasks:
-        """
-        guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system),
-              let tasks = parsePlannedTasks(from: response) else {
-            return fallback.plan(pdr: pdr, request: request)
+            User request: \(request.isEmpty ? "Follow the project plan." : request)
+
+            JSON array of tasks derived from the plan's active checklist:
+            """
+        } else {
+            prompt = """
+            PDR context:
+            \(pdr.contextSummary)
+
+            User request: \(request.isEmpty ? pdr.title : request)
+
+            JSON array of tasks:
+            """
         }
+        logger?.log("INFO", "[MAYOR] model=\(model) numCtx=\(numCtx) planContent=\(planContent != nil ? "yes(\(planContent!.count)chars)" : "none") request=\"\(String(request.prefix(120)))\"")
+        guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system) else {
+            logger?.log("ERROR", "[MAYOR] Ollama returned nil — no response received. Check that ollama is running and model '\(model)' is available.")
+            logger?.log("WARN",  "[MAYOR] Using fallback (DefaultMayorAdapter) — tasks may target tinkertown-task-notes.md and be filtered.")
+            return fallback.plan(pdr: pdr, request: request, planContent: planContent)
+        }
+        logger?.log("INFO",  "[MAYOR] Response received, length=\(response.count). Preview: \(WorkspaceLogger.preview(response))")
+        guard let tasks = parsePlannedTasks(from: response) else {
+            logger?.log("ERROR", "[MAYOR] JSON parse failed — response is not a valid task array. The model may have returned prose or invalid JSON.")
+            logger?.log("WARN",  "[MAYOR] Using fallback (DefaultMayorAdapter). This usually means the model output did not start with '[' or was malformed.")
+            return fallback.plan(pdr: pdr, request: request, planContent: planContent)
+        }
+        logger?.log("INFO",  "[MAYOR] Parsed \(tasks.count) task(s): \(tasks.map(\.title).joined(separator: ", "))")
         return tasks
     }
 
     func parsePlannedTasks(from jsonText: String) -> [PlannedTask]? {
         let stripped = Self.stripMarkdownCodeBlock(jsonText)
-        let trimmed = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidate = Self.extractFirstJSONArray(from: stripped)
+        let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let data = trimmed.data(using: .utf8),
               let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
             return nil
@@ -91,6 +126,27 @@ public struct OllamaMayorAdapter: MayorAdapting {
         return result.isEmpty ? nil : result
     }
 
+    /// Finds the first top-level JSON array `[…]` in the text, tolerating leading prose.
+    /// This lets us recover when the model prefixes its JSON with an explanation sentence.
+    static func extractFirstJSONArray(from text: String) -> String {
+        let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let start = s.firstIndex(of: "[") else { return s }
+        // Walk forward counting bracket depth to find the matching close bracket.
+        var depth = 0
+        var end = s.endIndex
+        for idx in s[start...].indices {
+            switch s[idx] {
+            case "[": depth += 1
+            case "]":
+                depth -= 1
+                if depth == 0 { end = s.index(after: idx); break }
+            default: break
+            }
+            if depth == 0 { break }
+        }
+        return String(s[start..<end])
+    }
+
     /// Strips optional markdown code fence so JSON can be parsed when the model returns ```json\n...\n```.
     static func stripMarkdownCodeBlock(_ text: String) -> String {
         let s = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -116,6 +172,7 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
     private let shell: ShellRunning
     private let guardrails: GuardrailService
     private let fallback: TinkerAdapting
+    public var logger: WorkspaceLogger?
 
     public init(
         client: OllamaClient = OllamaClient(),
@@ -123,7 +180,8 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
         numCtx: Int,
         shell: ShellRunning = ShellRunner(),
         guardrails: GuardrailService,
-        fallback: TinkerAdapting? = nil
+        fallback: TinkerAdapting? = nil,
+        logger: WorkspaceLogger? = nil
     ) {
         self.client = client
         self.model = model
@@ -131,6 +189,7 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
         self.shell = shell
         self.guardrails = guardrails
         self.fallback = fallback ?? DefaultTinkerAdapter(shell: shell, guardrails: guardrails)
+        self.logger = logger
     }
 
     public func apply(task: TaskRecord, context: String, worktree: URL) throws -> String {
@@ -169,10 +228,17 @@ public struct OllamaTinkerAdapter: TinkerAdapting {
 
         Output only the unified diff, or EXPLAIN: <reason> if you cannot implement it.
         """
-        guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system),
-              let resultMessage = try handleResponse(response, worktree: worktree) else {
+        logger?.log("INFO", "[TINKER] task=\"\(task.title)\" files=[\(task.targetFiles.joined(separator: ", "))] model=\(model)")
+        guard let response = client.generate(model: model, prompt: prompt, numCtx: numCtx, system: system) else {
+            logger?.log("ERROR", "[TINKER] task=\"\(task.title)\" — Ollama returned nil. Check model '\(model)' is available.")
             throw TinkerError(taskTitle: task.title, targetFiles: task.targetFiles)
         }
+        logger?.log("INFO",  "[TINKER] task=\"\(task.title)\" response length=\(response.count). Preview: \(WorkspaceLogger.preview(response))")
+        guard let resultMessage = try handleResponse(response, worktree: worktree) else {
+            logger?.log("ERROR", "[TINKER] task=\"\(task.title)\" — response did not contain a valid unified diff or patch failed to apply.")
+            throw TinkerError(taskTitle: task.title, targetFiles: task.targetFiles)
+        }
+        logger?.log("INFO",  "[TINKER] task=\"\(task.title)\" — patch applied. \(resultMessage)")
         return resultMessage
     }
 

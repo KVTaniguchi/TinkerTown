@@ -32,8 +32,8 @@ public struct PlannedTask {
 }
 
 public protocol MayorAdapting {
-    /// Produce a task graph from the PDR and optional user request.
-    func plan(pdr: PDRRecord, request: String) -> [PlannedTask]
+    /// Produce a task graph from the PDR, optional user request, and optional plan file content.
+    func plan(pdr: PDRRecord, request: String, planContent: String?) -> [PlannedTask]
 }
 
 public protocol TinkerAdapting {
@@ -43,7 +43,7 @@ public protocol TinkerAdapting {
 public struct DefaultMayorAdapter: MayorAdapting {
     public init() {}
 
-    public func plan(pdr: PDRRecord, request: String) -> [PlannedTask] {
+    public func plan(pdr: PDRRecord, request: String, planContent: String? = nil) -> [PlannedTask] {
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
         let effectiveRequest = trimmed.isEmpty ? pdr.title : trimmed
         let parts = effectiveRequest.components(separatedBy: " and ").filter { !$0.isEmpty }
@@ -115,6 +115,7 @@ public struct Orchestrator {
     private let mayor: MayorAdapting
     private let tinker: TinkerAdapting
     private let scaffolder: Scaffolder
+    private let logger: WorkspaceLogger?
 
     public init(
         root: URL,
@@ -128,7 +129,8 @@ public struct Orchestrator {
         mergeManager: MergeManaging,
         mayor: MayorAdapting,
         tinker: TinkerAdapting,
-        scaffolder: Scaffolder = Scaffolder()
+        scaffolder: Scaffolder = Scaffolder(),
+        logger: WorkspaceLogger? = nil
     ) {
         self.root = root
         self.paths = paths
@@ -142,6 +144,7 @@ public struct Orchestrator {
         self.mayor = mayor
         self.tinker = tinker
         self.scaffolder = scaffolder
+        self.logger = logger
     }
 
     /// Caller must resolve PDR (e.g. via PDRService.resolve) before calling. Then plan and execute.
@@ -171,11 +174,22 @@ public struct Orchestrator {
         try store.saveRun(runRecord)
 
         try transitionRun(&runRecord, to: .planning, actorRole: "planner")
-        let rawPlan = mayor.plan(pdr: pdr, request: request)
+        let planContent = PlanningService(paths: paths).readPlanContent()
+        logger?.log("INFO", "[PLAN] request=\"\(String(request.prefix(120)))\" planContent=\(planContent != nil ? "yes" : "none")")
+        let rawPlan = mayor.plan(pdr: pdr, request: request, planContent: planContent)
         // Drop any tasks whose only target is tinkertown-task-notes.md — these indicate
         // planning failures and would cause agents to loop writing documentation instead of code.
+        let docOnlyTitles = rawPlan.filter { $0.targetFiles.allSatisfy { $0 == "tinkertown-task-notes.md" } }.map(\.title)
+        if !docOnlyTitles.isEmpty {
+            logger?.log("WARN", "[PLAN] Filtered out \(docOnlyTitles.count) doc-only task(s) targeting tinkertown-task-notes.md: \(docOnlyTitles.joined(separator: ", ")). This usually means the Mayor fallback ran because Ollama failed or returned invalid JSON.")
+        }
         let plan = rawPlan.filter { task in
             !task.targetFiles.allSatisfy { $0 == "tinkertown-task-notes.md" }
+        }
+        if plan.isEmpty {
+            logger?.log("ERROR", "[PLAN] Zero tasks after filtering. The run will complete with no work done. Check Mayor logs above for the root cause.")
+        } else {
+            logger?.log("INFO", "[PLAN] \(plan.count) task(s) queued: \(plan.map(\.title).joined(separator: ", "))")
         }
 
         var tasks: [TaskRecord] = []
@@ -419,8 +433,10 @@ public struct Orchestrator {
             let outcome = try inspector.verify(task: task, runID: run.runID, attempt: attempts + 1, command: command, cwd: effectiveCwd)
             if outcome.exitCode != 0 {
                 lastVerifyOutput = outcome.rawOutput
+                logger?.log("WARN", "[VERIFY] task=\"\(task.title)\" attempt=\(attempts+1) command=\"\(command)\" exitCode=\(outcome.exitCode). Output: \(WorkspaceLogger.preview(outcome.rawOutput ?? ""))")
             } else {
                 lastVerifyOutput = nil
+                logger?.log("INFO", "[VERIFY] task=\"\(task.title)\" attempt=\(attempts+1) PASSED ✓")
             }
 
             // Capture simple diff stats for UI review before committing.
