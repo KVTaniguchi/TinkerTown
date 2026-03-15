@@ -1247,6 +1247,9 @@ private struct ContentView: View {
     private var primaryAction: PrimaryAction {
         if !model.hasChosenRepository { return .chooseWorkspace }
         if model.isBusy { return .stop }
+        // When not busy, prefer "Start Ollama" if service is down so user can fix it before running or resuming.
+        let ollamaDown = model.preflightChecks.contains { $0.name == "ollama service" && !$0.ok }
+        if ollamaDown { return .startOllama }
         if let run = model.runRecord {
             switch run.state {
             case .pendingApproval: return .approveAndStart
@@ -1258,8 +1261,7 @@ private struct ContentView: View {
             default: break
             }
         }
-        let ollamaDown = model.preflightChecks.contains { $0.name == "ollama service" && !$0.ok }
-        return ollamaDown ? .startOllama : .startRun
+        return .startRun
     }
 
     private var primaryButtonTitle: String {
