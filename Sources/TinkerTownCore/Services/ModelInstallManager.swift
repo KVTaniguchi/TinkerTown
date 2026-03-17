@@ -86,6 +86,7 @@ public final class ModelInstallManager: @unchecked Sendable {
     }
 
     /// Install a model: download (or ollama pull) -> verify -> register.
+    @available(iOS 15.0, *)
     public func install(
         manifest: ModelManifest,
         progress: @escaping @Sendable (ModelInstallProgress) -> Void

@@ -26,7 +26,7 @@ public struct DefaultMergeManager: MergeManaging {
         for idx in tasks.indices where tasks[idx].state == .mergeReady {
             var updated = tasks[idx]
             do {
-                try mergeGate.validateScope(task: tasks[idx], root: root)
+                try mergeGate.validateScope(task: tasks[idx], root: root, baseBranch: run.baseBranch)
                 let outcome = try mergeGate.merge(task: tasks[idx], root: root)
                 if outcome.decision == .merged {
                     try StateMachine.validateTaskTransition(from: updated.state, to: .merged)

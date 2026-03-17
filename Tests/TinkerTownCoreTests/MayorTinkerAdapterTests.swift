@@ -22,6 +22,28 @@ struct MayorTinkerAdapterTests {
         #expect(apiTask!.targetFiles.contains(where: { $0.contains("api") || $0.contains("schema") }))
     }
 
+    @Test func defaultMayorParsesPlanContentAndDerivesTasks() {
+        let mayor = DefaultMayorAdapter()
+        let planContent = """
+        # Project Plan
+        
+        ## Active Checklist (Mayor-owned)
+        - [ ] Add backend api
+        - [ ] Add frontend ui
+        """
+        
+        let request = "Follow the project plan."
+        let tasks = mayor.plan(pdr: Self.minimalPDR, request: request, planContent: planContent)
+
+        // Verifies that the DefaultMayorAdapter now correctly parses planContent
+        // and generates tasks for active checklist items.
+        #expect(tasks.count == 2)
+        #expect(tasks[0].title == "Add backend api")
+        #expect(tasks[0].targetFiles.contains(where: { $0.contains("api") }))
+        #expect(tasks[1].title == "Add frontend ui")
+        #expect(tasks[1].targetFiles.contains(where: { $0.contains("frontend") }))
+    }
+
     // MARK: - OllamaMayorAdapter JSON parsing
 
     @Test func parserSkipsTasksWithMissingTargetFiles() {

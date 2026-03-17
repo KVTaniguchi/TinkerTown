@@ -4,6 +4,8 @@ public struct InspectionOutcome {
     public var exitCode: Int32
     public var diagnostics: [DiagnosticRecord]
     public var errorClass: ErrorClass?
+    /// Raw stdout+stderr from the verification command, for passing into retry context.
+    public var rawOutput: String?
 }
 
 public struct Inspector {
@@ -41,7 +43,8 @@ public struct Inspector {
         return InspectionOutcome(
             exitCode: result.exitCode,
             diagnostics: diagnostics,
-            errorClass: command == "true" ? nil : (result.exitCode == 0 ? nil : .buildCompile)
+            errorClass: command == "true" ? nil : (result.exitCode == 0 ? nil : .buildCompile),
+            rawOutput: mergedOutput
         )
     }
 
@@ -54,9 +57,14 @@ public struct Inspector {
     }
 
     private func parseDiagnostics(taskID: String, from output: String, tool: String) -> [DiagnosticRecord] {
+        let swiftDiag = parseSwiftStyleDiagnostics(taskID: taskID, from: output, tool: tool)
+        if !swiftDiag.isEmpty { return swiftDiag }
+        return parseNodeStyleDiagnostics(taskID: taskID, from: output, tool: tool)
+    }
+
+    private func parseSwiftStyleDiagnostics(taskID: String, from output: String, tool: String) -> [DiagnosticRecord] {
         let lines = output.split(separator: "\n").map(String.init)
         var diagnostics: [DiagnosticRecord] = []
-
         let regex = try? NSRegularExpression(pattern: "([^:\\n]+):(\\d+):(\\d+):\\s*(error|warning):\\s*(.+)")
         for line in lines {
             guard let regex else { break }
@@ -80,7 +88,46 @@ public struct Inspector {
                 message: group(5)
             ))
         }
+        return diagnostics
+    }
 
+    /// Parses Node.js-style errors (e.g. "path/to/file.js:11" then "SyntaxError: Unexpected end of input").
+    private func parseNodeStyleDiagnostics(taskID: String, from output: String, tool: String) -> [DiagnosticRecord] {
+        let lines = output.split(separator: "\n").map(String.init)
+        var diagnostics: [DiagnosticRecord] = []
+        // Match path:line or path:line:column (Node prints file:line on first line of stack).
+        let pathLineRegex = try? NSRegularExpression(pattern: "^(.*):(\\d+)(?::(\\d+))?\\s*$")
+        for (idx, line) in lines.enumerated() {
+            guard let pathLineRegex else { break }
+            let nsRange = NSRange(line.startIndex..<line.endIndex, in: line)
+            guard let match = pathLineRegex.firstMatch(in: line, range: nsRange), match.numberOfRanges >= 3 else { continue }
+            func group(_ i: Int) -> String {
+                let range = match.range(at: i)
+                guard range.location != NSNotFound, let swiftRange = Range(range, in: line) else { return "" }
+                return String(line[swiftRange])
+            }
+            let file = group(1).trimmingCharacters(in: .whitespaces)
+            let lineNum = Int(group(2)) ?? 0
+            let column = match.numberOfRanges > 3 ? (Int(group(3)) ?? 0) : 0
+            var message = "runtime error"
+            if idx + 1 < lines.count {
+                let next = lines[idx + 1].trimmingCharacters(in: .whitespaces)
+                if next.contains("SyntaxError:") || next.contains("Error:") || next.hasPrefix("TypeError:") {
+                    message = next
+                }
+            }
+            diagnostics.append(DiagnosticRecord(
+                taskID: taskID,
+                tool: "node",
+                severity: "error",
+                code: "NODE_RUNTIME",
+                file: file.isEmpty ? nil : file,
+                line: lineNum > 0 ? lineNum : nil,
+                column: (match.numberOfRanges > 3 && column > 0) ? column : nil,
+                message: message
+            ))
+            break
+        }
         return diagnostics
     }
 }

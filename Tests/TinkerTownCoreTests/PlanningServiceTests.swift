@@ -55,4 +55,70 @@ struct PlanningServiceTests {
         #expect(read.contains("Project Plan – myapp"))
         #expect(read.contains("- [ ] First task"))
     }
+
+    @Test("plan detection: loadChecklistItems when plan file does not exist returns empty")
+    func loadChecklistItemsWhenNoPlanReturnsEmpty() {
+        let fs = InMemoryFileSystem()
+        let root = URL(fileURLWithPath: "/repo")
+        let paths = AppPaths(root: root)
+        let planning = PlanningService(fs: fs, paths: paths)
+
+        let items = planning.loadChecklistItems()
+        #expect(items.isEmpty)
+    }
+
+    @Test("plan detection: loadChecklistItems when plan file exists returns checklist items")
+    func loadChecklistItemsWhenPlanExistsReturnsItems() throws {
+        let fs = InMemoryFileSystem()
+        let root = URL(fileURLWithPath: "/repo")
+        let paths = AppPaths(root: root)
+        let planning = PlanningService(fs: fs, paths: paths)
+
+        let content = """
+        # Project Plan – myapp
+
+        ## Overview
+        Build a small CLI.
+
+        ## Active Checklist (Mayor-owned)
+        - [ ] First task
+        - [ ] Second task
+        - [x] Done task
+        """
+        _ = try planning.importPlanContent(content)
+
+        let items = planning.loadChecklistItems()
+        #expect(items.count == 3)
+        #expect(items[0].title == "First task")
+        #expect(!items[0].completed)
+        #expect(items[1].title == "Second task")
+        #expect(!items[1].completed)
+        #expect(items[2].title == "Done task")
+        #expect(items[2].completed)
+    }
+
+    @Test("plan detection: ensureDefaultPlanExists then loadChecklistItems returns at least one item")
+    func ensureDefaultPlanThenLoadChecklistReturnsItems() throws {
+        let fs = InMemoryFileSystem()
+        let root = URL(fileURLWithPath: "/repo")
+        let paths = AppPaths(root: root)
+        let planning = PlanningService(fs: fs, paths: paths)
+
+        _ = try planning.ensureDefaultPlanExists(title: "Test Project")
+        let items = planning.loadChecklistItems()
+        #expect(!items.isEmpty)
+        #expect(items.contains(where: { $0.title.contains("First") || $0.title.contains("task") }))
+    }
+
+    @Test("plan detection: planFileExists is false when no file, true after import")
+    func planFileExistsReflectsFilePresence() throws {
+        let fs = InMemoryFileSystem()
+        let root = URL(fileURLWithPath: "/repo")
+        let paths = AppPaths(root: root)
+        let planning = PlanningService(fs: fs, paths: paths)
+
+        #expect(!planning.planFileExists)
+        _ = try planning.importPlanContent("# Project Plan – x\n\n## Overview\nOK.")
+        #expect(planning.planFileExists)
+    }
 }

@@ -11,7 +11,7 @@ public struct OllamaClient {
     public var baseURL: URL
     public var timeout: TimeInterval
 
-    public init(baseURL: URL = URL(string: "http://localhost:11434")!, timeout: TimeInterval = 120) {
+    public init(baseURL: URL = URL(string: "http://localhost:11434")!, timeout: TimeInterval = 600) {
         self.baseURL = baseURL
         self.timeout = timeout
     }

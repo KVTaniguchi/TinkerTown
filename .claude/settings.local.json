@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(swift build:*)",
+      "Bash(swift test:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(xcodebuild -project TinkerTown.xcodeproj -scheme TinkerTownApp -configuration Debug build 2>&1 | tail -20)",
+      "Bash(find /Users/ktaniguchi/Library/Developer/Xcode/DerivedData/TinkerTown-dcvlzstzdevfytdikclszntnrfxr -name \"*.app\" 2>/dev/null | head -5)",
+      "Bash(xcodebuild -project /Users/ktaniguchi/Development/TinkerTown/TinkerTown.xcodeproj -scheme TinkerTownApp -configuration Debug build 2>&1 | grep -E \"error:|warning:|BUILD|FAILED|SUCCEEDED\" | head -30)",
+      "Bash(pkill -x TinkerTownApp 2>/dev/null; echo \"Cleaned up\")",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260311_005240/tasks/task_001.json | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('state:', d['state']\\); print\\('title:', d['title']\\); print\\('targets:', d.get\\('targetFiles',[]\\)\\); print\\('verify:', d.get\\('verify',{}\\)\\)\")",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_003704/run.json | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('tasks:', d['taskIDs']\\); print\\('state:', d['state']\\); print\\('request:', d['request']\\)\")",
+      "Bash(for f:*)",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/config.json | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('mayor:', d['models']['mayor']\\); print\\('tinker:', d['models']['tinker']\\)\")",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_181423/run.json 2>/dev/null | python3 -m json.tool | head -30)",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_181423/tasks/task_001.json | python3 -m json.tool)"
+    ]
+  }
+}

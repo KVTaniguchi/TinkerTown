@@ -26,6 +26,7 @@ struct WorktreeManagerTests {
         try fs.createDirectory(root.appendingPathComponent(".tinkertown/task_001"))
 
         let results: [String: ShellResult] = [
+            "git rev-parse --verify HEAD": ShellResult(exitCode: 0, stdout: "abc123\n", stderr: ""),
             "git worktree add .tinkertown/task_001 -b tinkertown/task_001 main": ShellResult(exitCode: 0, stdout: "", stderr: ""),
             "git rev-parse main": ShellResult(exitCode: 0, stdout: "abc123\n", stderr: ""),
             "git rev-parse HEAD": ShellResult(exitCode: 0, stdout: "abc123\n", stderr: "")
@@ -44,6 +45,7 @@ struct WorktreeManagerTests {
         try? fs.createDirectory(root.appendingPathComponent(".tinkertown/task_001"))
 
         let results: [String: ShellResult] = [
+            "git rev-parse --verify HEAD": ShellResult(exitCode: 0, stdout: "abc123\n", stderr: ""),
             "git worktree add .tinkertown/task_001 -b tinkertown/task_001 main": ShellResult(exitCode: 0, stdout: "", stderr: ""),
             "git rev-parse main": ShellResult(exitCode: 0, stdout: "abc123\n", stderr: ""),
             "git rev-parse HEAD": ShellResult(exitCode: 0, stdout: "def456\n", stderr: "")

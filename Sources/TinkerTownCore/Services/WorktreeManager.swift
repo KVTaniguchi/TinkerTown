@@ -10,14 +10,29 @@ public struct WorktreeManager {
     }
 
     public func create(taskID: String, root: URL, baseBranch: String) throws -> (path: String, branch: String) {
+        // Git worktree add requires the base branch to resolve to a commit. Ensure at least one commit exists.
+        try ensureAtLeastOneCommit(root: root)
+
         let branch = "tinkertown/\(taskID)"
         let worktreeRel = ".tinkertown/\(taskID)"
+        // Remove leftover worktree/branch from a previous run so this run can create fresh (avoids "already exists").
+        removeWorktreeAndBranchIfPresent(worktreeRel: worktreeRel, branch: branch, root: root)
+
         let command = "git worktree add \(worktreeRel) -b \(branch) \(baseBranch)"
-        _ = try shell.run(command, cwd: root)
+        let addResult = try shell.run(command, cwd: root)
 
         let path = root.appendingPathComponent(worktreeRel)
-        guard fs.fileExists(path) else {
-            throw NSError(domain: "WorktreeManager", code: 1, userInfo: [NSLocalizedDescriptionKey: "Worktree path missing after create"])
+        guard addResult.exitCode == 0, fs.fileExists(path) else {
+            let detail = !addResult.stderr.isEmpty ? addResult.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+                : "Worktree path missing after create."
+            let hint = detail.contains("invalid reference") || detail.contains("not a valid object")
+                ? " The repository may have no commits yet; make an initial commit and retry."
+                : ""
+            throw NSError(
+                domain: "WorktreeManager",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "\(detail)\(hint)"]
+            )
         }
 
         // Validate that the new worktree HEAD matches the base branch SHA to guard against
@@ -53,7 +68,34 @@ public struct WorktreeManager {
             let path = String(line.dropFirst("worktree ".count))
             if path.contains("/.tinkertown/") {
                 _ = try? shell.run("git worktree remove \(path) --force", cwd: root)
+                if let taskID = path.split(separator: "/").last.map(String.init), !taskID.isEmpty {
+                    _ = try? shell.run("git branch -D tinkertown/\(taskID)", cwd: root)
+                }
             }
+        }
+    }
+
+    /// Removes the worktree at worktreeRel and deletes the branch if present (best-effort). Call before creating so a new run can reuse the path/branch.
+    private func removeWorktreeAndBranchIfPresent(worktreeRel: String, branch: String, root: URL) {
+        let fullPath = root.appendingPathComponent(worktreeRel)
+        if fs.fileExists(fullPath) {
+            _ = try? shell.run("git worktree remove \(worktreeRel) --force", cwd: root)
+        }
+        _ = try? shell.run("git branch -D \(branch)", cwd: root)
+    }
+
+    /// Ensures the repository has at least one commit so `git worktree add` can use the base branch.
+    private func ensureAtLeastOneCommit(root: URL) throws {
+        let headResult = try shell.run("git rev-parse --verify HEAD", cwd: root)
+        if headResult.exitCode == 0 { return }
+        let commitResult = try shell.run(#"git commit --allow-empty -m "Initial commit (created by TinkerTown)""#, cwd: root)
+        guard commitResult.exitCode == 0 else {
+            let msg = !commitResult.stderr.isEmpty ? commitResult.stderr : commitResult.stdout
+            throw NSError(
+                domain: "WorktreeManager",
+                code: 3,
+                userInfo: [NSLocalizedDescriptionKey: "Repository has no commits and creating initial commit failed: \(msg)"]
+            )
         }
     }
 }

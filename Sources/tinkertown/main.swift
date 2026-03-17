@@ -357,11 +357,10 @@ struct TinkerTownCLI {
             )
         }
 
-        // Double-check that the expected base branch exists.
-        let shell = ShellRunner()
-        let branch = try shell.run("git rev-parse --verify main", cwd: cwd)
-        guard branch.exitCode == 0 else {
-            throw NSError(domain: "tinkertown", code: 2, userInfo: [NSLocalizedDescriptionKey: "Base branch 'main' not found. Create or rename your primary branch to 'main'."])
+        // Ensure a default branch exists (main, master, or origin/HEAD).
+        let defaultBranch = try GitDefaultBranch().detect(at: cwd)
+        guard !defaultBranch.isEmpty else {
+            throw NSError(domain: "tinkertown", code: 2, userInfo: [NSLocalizedDescriptionKey: "No default branch found. Ensure the repository has a branch (e.g. main or master)."])
         }
     }
 }

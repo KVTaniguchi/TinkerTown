@@ -17,10 +17,18 @@ public struct PlanningService {
         self.paths = paths
     }
 
-    /// Default location for the project plan.
+    /// Default location for the project plan. Uses standardized file URL so detection
+    /// is consistent regardless of trailing slash, symlinks, or path form.
     public var planFile: URL {
-        let planDir = paths.root.appendingPathComponent("plan", isDirectory: true)
+        let root = paths.root.standardizedFileURL
+        let planDir = root.appendingPathComponent("plan", isDirectory: true)
         return planDir.appendingPathComponent("PROJECT_PLAN.md")
+    }
+
+    /// Whether the plan file exists at the default location. Use this to detect a plan
+    /// even when it has no checklist items (so the UI can show "View plan" etc.).
+    public var planFileExists: Bool {
+        fs.fileExists(planFile)
     }
 
     /// Result of importing or parsing a project plan (e.g. for PDR derivation).
@@ -98,6 +106,17 @@ public struct PlanningService {
         return planFile
     }
 
+    /// Returns the full text of PROJECT_PLAN.md, or nil if the file does not exist.
+    /// Used to pass the plan to the Mayor so it can derive tasks directly from the plan.
+    public func readPlanContent() -> String? {
+        guard fs.fileExists(planFile),
+              let data = try? fs.read(planFile),
+              let text = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return text
+    }
+
     /// Load the current checklist items from the plan file, if it exists.
     /// The sidebar checklist is read-only from this file; it is not auto-updated
     /// when tasks complete. Use `markChecklistItemsComplete(titles:)` to tick items.
@@ -110,7 +129,13 @@ public struct PlanningService {
               let text = String(data: data, encoding: .utf8) else {
             return []
         }
+        return Self.parseChecklistItems(from: text)
+    }
 
+    /// Parses checklist items from a project plan string.
+    /// Lines starting with `- [ ]` or `- [x]` are treated as checklist entries.
+    /// Also accepts bare `[ ] Task` or `[x] Task`.
+    public static func parseChecklistItems(from text: String) -> [PlanningChecklistItem] {
         var items: [PlanningChecklistItem] = []
         for line in text.split(whereSeparator: \.isNewline) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -127,8 +152,7 @@ public struct PlanningService {
                 continue
             }
 
-            // Forgiving mode: accept bare `[ ] Task` / `[x] Task` lines that are
-            // missing the leading dash so human-authored plans still work.
+            // Forgiving mode: accept bare `[ ] Task` / `[x] Task` lines.
             if trimmed.hasPrefix("[ ] ") {
                 let title = String(trimmed.dropFirst("[ ] ".count))
                 items.append(PlanningChecklistItem(title: title, completed: false))

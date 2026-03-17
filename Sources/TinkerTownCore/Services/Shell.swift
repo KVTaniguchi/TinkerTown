@@ -38,8 +38,10 @@ public struct ShellRunner: ShellRunning {
     public func run(_ command: String, cwd: URL? = nil) throws -> ShellResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        // -l login, -i interactive: so .zshrc is sourced and nvm/fnm/volta add node to PATH
-        process.arguments = ["-lic", command]
+        // Non-login, non-interactive: avoids sourcing .zshrc (which can hang on interactive
+        // prompts or add seconds of startup overhead per call). PATH is augmented manually
+        // in subprocessEnvironment so nvm/fnm/volta/Homebrew are still found.
+        process.arguments = ["-c", command]
         process.environment = Self.subprocessEnvironment
         if let cwd {
             process.currentDirectoryURL = cwd

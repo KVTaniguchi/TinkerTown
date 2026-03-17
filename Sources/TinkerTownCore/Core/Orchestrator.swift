@@ -45,6 +45,17 @@ public struct DefaultMayorAdapter: MayorAdapting {
 
     public func plan(pdr: PDRRecord, request: String, planContent: String? = nil) -> [PlannedTask] {
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (trimmed.isEmpty || trimmed.lowercased() == "follow the project plan.") && planContent != nil {
+            let items = PlanningService.parseChecklistItems(from: planContent!)
+            let active = items.filter { !$0.completed }
+            if !active.isEmpty {
+                return active.enumerated().map { idx, item in
+                    let targets = Self.targetFilesFromTitle(item.title)
+                    return PlannedTask(title: item.title, priority: max(1, 3 - idx), targetFiles: targets)
+                }
+            }
+        }
+
         let effectiveRequest = trimmed.isEmpty ? pdr.title : trimmed
         let parts = effectiveRequest.components(separatedBy: " and ").filter { !$0.isEmpty }
         if parts.count > 1 {

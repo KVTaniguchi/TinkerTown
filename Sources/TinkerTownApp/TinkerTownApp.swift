@@ -78,6 +78,7 @@ private final class AppViewModel: ObservableObject {
     /// When the failure explanation mentions a button, we highlight it so the user knows what to press.
     @Published var highlightedButtonIDs: Set<String> = []
     @Published var activityFeed: [ActivityFeedEntry] = []
+    @Published var mayorChannel: [ActivityFeedEntry] = []
 
     // MARK: Autopilot
     @Published var autopilotEnabled: Bool = UserDefaults.standard.bool(forKey: "autopilot.enabled") {
@@ -367,6 +368,7 @@ private final class AppViewModel: ObservableObject {
         let trimmed = request.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         appendActivity("▶", actor: "app", message: "Starting: \(String(trimmed.prefix(80)))", level: .info)
+        appendMayor("🤔", message: "Planning: \"\(String(trimmed.prefix(100)))\"", level: .progress)
         runOrchestrationInBackground { [repoURL] in
             let context = try self.makeContext(root: repoURL)
             try Self.ensureGitPreflight(cwd: repoURL)
@@ -404,6 +406,14 @@ private final class AppViewModel: ObservableObject {
                 self.logsText = logs
                 self.preflightChecks = (try? Self.preflightChecks(root: repoURL, config: context.config)) ?? []
                 self.updateFailureExplanationIfNeeded(runID: runID, taskID: self.selectedTaskID, logs: logs)
+                if taskList.isEmpty {
+                    self.appendMayor("⚠", message: "No tasks were planned. The model may have returned an unparseable response — check .tinkertown/tinkertown.log.", level: .failure)
+                } else {
+                    self.appendMayor("📋", message: "Dispatching \(taskList.count) task\(taskList.count == 1 ? "" : "s") to Tinkers:")
+                    for task in taskList {
+                        self.appendMayor("→", message: "\(task.title) [\(task.targetFiles.joined(separator: ", "))]")
+                    }
+                }
             }
             try orchestrator.execute(runID: runID, approvedTaskIDs: nil)
         }
@@ -559,10 +569,18 @@ private final class AppViewModel: ObservableObject {
                 }
                 statusMessage = "Run completed"
                 appendActivity("●", actor: "app", message: "Run completed", level: .success)
+                let merged = tasks.filter { $0.state == .merged || $0.state == .cleaned }.count
+                let failed = tasks.filter { $0.state == .failed || $0.state == .rejected }.count
+                if failed == 0 {
+                    appendMayor("✅", message: "All done. \(merged) task\(merged == 1 ? "" : "s") merged successfully.", level: .success)
+                } else {
+                    appendMayor("⚠", message: "\(merged) merged, \(failed) failed. Review the log for details.", level: .failure)
+                }
             case .failure(let error):
                 errorMessage = error.localizedDescription
                 statusMessage = "Failed"
                 appendActivity("!", actor: "app", message: error.localizedDescription, level: .failure)
+                appendMayor("✗", message: "Run stopped with error: \(error.localizedDescription)", level: .failure)
                 try? refreshSelectedRun()
             }
             isBusy = false
@@ -1102,6 +1120,7 @@ private final class AppViewModel: ObservableObject {
         errorMessage = nil
         statusMessage = "Ready"
         activityFeed = []
+        mayorChannel = []
         seenTaskStates = [:]
         requestText = ""
     }
@@ -1115,6 +1134,14 @@ private final class AppViewModel: ObservableObject {
         AppLogger.shared.log(level == .failure ? "ERROR" : "INFO", actor: actor.uppercased(), message)
     }
 
+    func appendMayor(_ icon: String, message: String, level: ActivityFeedEntry.Level = .info) {
+        let entry = ActivityFeedEntry(timestamp: .now, icon: icon, actor: "mayor", message: message, level: level)
+        mayorChannel.append(entry)
+        if mayorChannel.count > 200 {
+            mayorChannel = Array(mayorChannel.suffix(200))
+        }
+    }
+
     func updateActivityFeedFromTasks(_ newTasks: [TaskRecord]) {
         for task in newTasks {
             let prev = seenTaskStates[task.taskID]
@@ -1125,16 +1152,25 @@ private final class AppViewModel: ObservableObject {
                 appendActivity("⚙", actor: "tinker", message: "Setting up: \(task.title)", level: .progress)
             case .prompted:
                 appendActivity("✎", actor: task.currentActorRole ?? "tinker", message: "Generating: \(task.title)", level: .progress)
+                appendMayor("→", message: "Tinker working on: \(task.title)", level: .progress)
             case .patchApplied:
                 appendActivity("◆", actor: "tinker", message: "Patch applied: \(task.title)", level: .info)
             case .verifying:
                 appendActivity("◎", actor: "inspector", message: "Verifying: \(task.title)", level: .progress)
+                appendMayor("◎", message: "Verifying build for: \(task.title)", level: .progress)
             case .merged, .cleaned:
                 appendActivity("✓", actor: "merge", message: "Merged: \(task.title)", level: .success)
+                appendMayor("✓", message: "\(task.title) — merged ✓", level: .success)
             case .rejected:
                 appendActivity("✗", actor: "merge", message: "Rejected: \(task.title)", level: .failure)
+                appendMayor("✗", message: "\(task.title) — rejected", level: .failure)
             case .failed:
                 appendActivity("✗", actor: "tinker", message: "Failed: \(task.title) (retry \(task.retryCount)/\(task.maxRetries))", level: .failure)
+                if task.retryCount < task.maxRetries {
+                    appendMayor("↺", message: "\(task.title) failed — retrying (\(task.retryCount + 1)/\(task.maxRetries))", level: .failure)
+                } else {
+                    appendMayor("✗", message: "\(task.title) — exhausted all retries", level: .failure)
+                }
             default:
                 break
             }
@@ -1492,32 +1528,97 @@ private struct ContentView: View {
     // MARK: Composer
 
     private var composerSection: some View {
-        HStack(alignment: .bottom, spacing: 12) {
-            ZStack(alignment: .topLeading) {
-                TextEditor(text: $model.requestText)
-                    .font(.system(size: 13))
-                    .frame(minHeight: 36, maxHeight: 140)
-                    .scrollContentBackground(.hidden)
-                    .padding(8)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-                    .disabled(model.isBusy)
-                if model.requestText.isEmpty {
-                    Text("Describe a task, ask a question, or give the mayor instructions…")
+        HStack(spacing: 0) {
+            // Left: user input
+            HStack(alignment: .bottom, spacing: 12) {
+                ZStack(alignment: .topLeading) {
+                    TextEditor(text: $model.requestText)
                         .font(.system(size: 13))
+                        .frame(minHeight: 36, maxHeight: 140)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                        .disabled(model.isBusy)
+                    if model.requestText.isEmpty {
+                        Text("Describe a task, ask a question, or give the mayor instructions…")
+                            .font(.system(size: 13))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 16)
+                            .allowsHitTesting(false)
+                    }
+                }
+                Button("Send") { model.runRequest() }
+                    .keyboardShortcut(.return, modifiers: .command)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isBusy || model.requestText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity)
+
+            Divider()
+
+            // Right: Mayor channel
+            mayorChannelPanel
+                .frame(maxWidth: .infinity)
+        }
+        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(maxHeight: 160)
+    }
+
+    private var mayorChannelPanel: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("MAYOR")
+                    .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if !model.mayorChannel.isEmpty {
+                    Button("Clear") { model.mayorChannel = [] }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 16)
-                        .allowsHitTesting(false)
                 }
             }
-            Button("Send") { model.runRequest() }
-                .keyboardShortcut(.return, modifiers: .command)
-                .buttonStyle(.borderedProminent)
-                .disabled(model.isBusy || model.requestText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 3) {
+                        if model.mayorChannel.isEmpty {
+                            Text(model.hasChosenRepository ? "Waiting for the Mayor…" : "Choose a workspace to get started.")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.tertiary)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 4)
+                        } else {
+                            ForEach(model.mayorChannel) { entry in
+                                HStack(alignment: .top, spacing: 6) {
+                                    Text(entry.icon)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(entry.iconColor)
+                                        .frame(width: 14)
+                                    Text(entry.message)
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(entry.level == .failure ? Color.red : entry.level == .success ? Color.green : Color.primary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .padding(.horizontal, 12)
+                                .id(entry.id)
+                            }
+                            Color.clear.frame(height: 1).id("mayorBottom")
+                        }
+                    }
+                    .padding(.bottom, 8)
+                }
+                .onChange(of: model.mayorChannel.count) { _ in
+                    withAnimation { proxy.scrollTo("mayorBottom", anchor: .bottom) }
+                }
+            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: Sheets
