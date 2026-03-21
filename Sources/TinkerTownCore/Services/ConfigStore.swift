@@ -15,6 +15,7 @@ public struct ConfigStore {
     public func bootstrap() throws -> AppConfig {
         try fs.createDirectory(paths.tinkerRoot)
         try fs.createDirectory(paths.runsRoot)
+        try fs.createDirectory(paths.agentsRoot)
 
         if !fs.fileExists(paths.configFile) {
             let data = try codec.encoder.encode(AppConfig.default)

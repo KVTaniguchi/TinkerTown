@@ -50,6 +50,7 @@ private final class AppViewModel: ObservableObject {
     @Published var selectedRunID: String?
     @Published var runRecord: RunRecord?
     @Published var tasks: [TaskRecord] = []
+    @Published var agents: [AgentRecord] = []
     @Published var selectedTaskID: String?
     @Published var logsText: String = ""
     @Published var preflightChecks: [PreflightCheck] = []
@@ -146,6 +147,7 @@ private final class AppViewModel: ObservableObject {
             let selected = runIDs.first
             let selectedRun = try selected.map { try context.store.loadRun($0) }
             let selectedTasks = try selected.map { try context.store.listTasks(runID: $0) } ?? []
+            let agents = try context.store.listAgents()
             let logs = try selected.map { try Self.readRunLogs(paths: context.paths, runID: $0) } ?? ""
             self.preflightChecks = checks
             self.currentConfig = context.config
@@ -154,6 +156,7 @@ private final class AppViewModel: ObservableObject {
             self.selectedRunID = selected
             self.runRecord = selectedRun
             self.tasks = selectedTasks
+            self.agents = agents
             self.selectedTaskID = selectedTasks.first?.taskID
             self.logsText = logs
         }
@@ -180,11 +183,13 @@ private final class AppViewModel: ObservableObject {
             let context = try self.makeContext(root: repoURL)
             let run = try context.store.loadRun(runID)
             let taskList = try context.store.listTasks(runID: runID)
+            let agents = try context.store.listAgents()
             let selected = selectedTaskID ?? taskList.first?.taskID
             let logs = try Self.readLogs(paths: context.paths, runID: runID, taskID: selected)
             self.currentConfig = context.config
             self.runRecord = run
             self.tasks = taskList
+            self.agents = agents
             self.approvedTaskIDs = Set(taskList.map(\.taskID))
             self.selectedTaskID = selected
             self.logsText = logs
@@ -394,6 +399,7 @@ private final class AppViewModel: ObservableObject {
             let runIDs = try context.store.listRuns().sorted(by: >)
             let run = try context.store.loadRun(runID)
             let taskList = try context.store.listTasks(runID: runID)
+            let agents = try context.store.listAgents()
             let logs = try Self.readRunLogs(paths: context.paths, runID: runID)
             DispatchQueue.main.sync {
                 self.currentConfig = context.config
@@ -401,6 +407,7 @@ private final class AppViewModel: ObservableObject {
                 self.selectedRunID = runID
                 self.runRecord = run
                 self.tasks = taskList
+                self.agents = agents
                 self.approvedTaskIDs = Set(taskList.map(\.taskID))
                 self.selectedTaskID = taskList.first?.taskID
                 self.logsText = logs
@@ -610,10 +617,12 @@ private final class AppViewModel: ObservableObject {
         let context = try makeContext(root: repoURL)
         let run = try context.store.loadRun(runID)
         let taskList = try context.store.listTasks(runID: runID)
+        let agentsList = try context.store.listAgents()
         let logs = try Self.readLogs(paths: context.paths, runID: runID, taskID: selectedTaskID)
         runRecord = run
         currentConfig = context.config
         tasks = taskList
+        agents = agentsList
         updateActivityFeedFromTasks(taskList)
         logsText = logs
         preflightChecks = (try? Self.preflightChecks(root: repoURL, config: context.config)) ?? preflightChecks
@@ -757,6 +766,7 @@ private final class AppViewModel: ObservableObject {
         }
 
         let store = RunStore(paths: paths)
+        try? store.ensureDefaultAgents(maxParallelTasks: config.orchestrator.maxParallelTasks)
         let events = EventLogger(paths: paths)
         let guardrails = GuardrailService(config: config.guardrails)
         let inspector = Inspector(eventLogger: events)
@@ -1212,6 +1222,48 @@ private struct WorkerPill: View {
     }
 }
 
+private struct AgentCard: View {
+    let agent: AgentRecord
+
+    private var stateColor: Color {
+        switch agent.state {
+        case .blocked: return .red
+        case .busy: return .green
+        case .idle, .offline: return .secondary
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(agent.name)
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+                Text(agent.state.rawValue)
+                    .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(stateColor)
+            }
+            Text(agent.role.rawValue.uppercased())
+                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .foregroundStyle(.secondary)
+            if let activity = agent.currentActivity, !activity.isEmpty {
+                Text(activity)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+            }
+            if let taskID = agent.currentTaskID {
+                Text(taskID)
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.45), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.12), lineWidth: 1))
+    }
+}
+
 // MARK: - Main UI
 
 private struct ContentView: View {
@@ -1234,6 +1286,7 @@ private struct ContentView: View {
             HStack(alignment: .top, spacing: 20) {
                 primaryButtonPanel
                 activityFeedPanel
+                agentsPanel
             }
             .padding(20)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1518,6 +1571,33 @@ private struct ContentView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var agentsPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Agents")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.secondary)
+
+            Group {
+                if model.agents.isEmpty {
+                    Text("No agents registered yet.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.tertiary)
+                        .padding(.top, 4)
+                } else {
+                    ForEach(model.agents, id: \.agentID) { agent in
+                        AgentCard(agent: agent)
+                    }
+                }
+            }
+
+            Spacer()
+        }
+        .padding(12)
+        .frame(minWidth: 220, idealWidth: 220, maxWidth: 220, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
     }
 
     private var emptyFeedMessage: String {

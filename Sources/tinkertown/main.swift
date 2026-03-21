@@ -11,6 +11,7 @@ struct TinkerTownCLI {
             let config = try configStore.bootstrap()
 
             let store = RunStore(paths: paths)
+            try? store.ensureDefaultAgents(maxParallelTasks: config.orchestrator.maxParallelTasks)
             let events = EventLogger(paths: paths)
             let guardrails = GuardrailService(config: config.guardrails)
             let inspector = Inspector(eventLogger: events)

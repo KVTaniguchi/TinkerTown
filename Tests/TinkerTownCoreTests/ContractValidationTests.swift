@@ -110,5 +110,26 @@ struct ContractValidationTests {
             try pdr.validate()
         }
     }
-}
 
+    @Test func agentRecordValidationEnforcesRequiredFields() throws {
+        var agent = AgentRecord(agentID: "mayor_001", name: "Mayor", role: .mayor)
+        try agent.validate()
+
+        agent.agentID = ""
+        #expect(throws: ContractError.self) {
+            try agent.validate()
+        }
+
+        agent.agentID = "mayor_001"
+        agent.name = ""
+        #expect(throws: ContractError.self) {
+            try agent.validate()
+        }
+
+        agent.name = "Mayor"
+        agent.unreadMessageCount = -1
+        #expect(throws: ContractError.self) {
+            try agent.validate()
+        }
+    }
+}

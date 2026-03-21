@@ -214,6 +214,70 @@ public struct GoalProgressSummary: Codable, Equatable, Sendable {
     }
 }
 
+public enum AgentRole: String, Codable, CaseIterable, Sendable {
+    case mayor
+    case tinker
+    case monitor
+    case operatorRole = "operator"
+    case orchestrator
+}
+
+public enum AgentState: String, Codable, CaseIterable, Sendable {
+    case idle = "IDLE"
+    case busy = "BUSY"
+    case blocked = "BLOCKED"
+    case offline = "OFFLINE"
+}
+
+public struct AgentRecord: Codable, Equatable, Sendable {
+    public var schemaVersion: Int
+    public var agentID: String
+    public var name: String
+    public var role: AgentRole
+    public var state: AgentState
+    public var currentRunID: String?
+    public var currentTaskID: String?
+    public var currentActivity: String?
+    public var unreadMessageCount: Int
+    public var createdAt: Date
+    public var updatedAt: Date
+
+    public init(
+        schemaVersion: Int = 1,
+        agentID: String,
+        name: String,
+        role: AgentRole,
+        state: AgentState = .idle,
+        currentRunID: String? = nil,
+        currentTaskID: String? = nil,
+        currentActivity: String? = nil,
+        unreadMessageCount: Int = 0,
+        createdAt: Date = Date(),
+        updatedAt: Date = Date()
+    ) {
+        self.schemaVersion = schemaVersion
+        self.agentID = agentID
+        self.name = name
+        self.role = role
+        self.state = state
+        self.currentRunID = currentRunID
+        self.currentTaskID = currentTaskID
+        self.currentActivity = currentActivity
+        self.unreadMessageCount = unreadMessageCount
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    public func validate() throws {
+        guard schemaVersion == 1 else {
+            throw ContractError.invalidRecord("unsupported AgentRecord schema version \(schemaVersion)")
+        }
+        guard !agentID.isEmpty else { throw ContractError.invalidRecord("agent_id is required") }
+        guard !name.isEmpty else { throw ContractError.invalidRecord("agent name is required") }
+        guard unreadMessageCount >= 0 else { throw ContractError.invalidRecord("unread_message_count must be >= 0") }
+    }
+}
+
 public struct RunRecord: Codable, Equatable, Sendable {
     public var schemaVersion: Int
     public var runID: String
@@ -295,12 +359,16 @@ public struct TaskRecord: Codable, Equatable, Sendable {
     public var coeditable: Bool
     /// Optional goal this task contributes to; nil = part of implicit run goal.
     public var goalId: String?
+    /// Durable worker assignment for this task.
+    public var assignedAgentId: String?
     public var retryCount: Int
     public var maxRetries: Int
     public var verify: VerifyResult
     public var result: TaskResult
     /// Role currently or last acting on this task (e.g. "worker", "orchestrator").
     public var currentActorRole: String?
+    /// Concrete agent currently or last acting on this task.
+    public var currentActorId: String?
     /// Human-readable activity description (e.g. "verifying", "merging").
     public var currentActivity: String?
 
@@ -319,11 +387,13 @@ public struct TaskRecord: Codable, Equatable, Sendable {
         targetFiles: [String],
         coeditable: Bool = false,
         goalId: String? = nil,
+        assignedAgentId: String? = nil,
         retryCount: Int = 0,
         maxRetries: Int,
         verify: VerifyResult,
         result: TaskResult = TaskResult(),
         currentActorRole: String? = nil,
+        currentActorId: String? = nil,
         currentActivity: String? = nil
     ) {
         self.schemaVersion = schemaVersion
@@ -340,11 +410,13 @@ public struct TaskRecord: Codable, Equatable, Sendable {
         self.targetFiles = targetFiles
         self.coeditable = coeditable
         self.goalId = goalId
+        self.assignedAgentId = assignedAgentId
         self.retryCount = retryCount
         self.maxRetries = maxRetries
         self.verify = verify
         self.result = result
         self.currentActorRole = currentActorRole
+        self.currentActorId = currentActorId
         self.currentActivity = currentActivity
     }
 

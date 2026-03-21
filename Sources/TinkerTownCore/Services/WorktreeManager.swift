@@ -62,15 +62,26 @@ public struct WorktreeManager {
     }
 
     public func cleanupOrphaned(root: URL) {
-        guard let output = try? shell.run("git worktree list --porcelain", cwd: root).stdout else { return }
-        let lines = output.split(separator: "\n").map(String.init)
-        for line in lines where line.hasPrefix("worktree ") {
-            let path = String(line.dropFirst("worktree ".count))
-            if path.contains("/.tinkertown/") {
-                _ = try? shell.run("git worktree remove \(path) --force", cwd: root)
-                if let taskID = path.split(separator: "/").last.map(String.init), !taskID.isEmpty {
-                    _ = try? shell.run("git branch -D tinkertown/\(taskID)", cwd: root)
+        // Remove worktrees registered in git under .tinkertown/.
+        if let output = try? shell.run("git worktree list --porcelain", cwd: root).stdout {
+            let lines = output.split(separator: "\n").map(String.init)
+            for line in lines where line.hasPrefix("worktree ") {
+                let path = String(line.dropFirst("worktree ".count))
+                if path.contains("/.tinkertown/") {
+                    _ = try? shell.run("git worktree remove \(path) --force", cwd: root)
+                    if let taskID = path.split(separator: "/").last.map(String.init), !taskID.isEmpty {
+                        _ = try? shell.run("git branch -D tinkertown/\(taskID)", cwd: root)
+                    }
                 }
+            }
+        }
+
+        // Also remove orphaned task directories under .tinkertown/ that exist on disk but are
+        // no longer registered as git worktrees (left behind when a previous run was interrupted).
+        let tinkerRoot = root.appendingPathComponent(".tinkertown")
+        if let items = try? FileManager.default.contentsOfDirectory(at: tinkerRoot, includingPropertiesForKeys: nil) {
+            for item in items where item.lastPathComponent.hasPrefix("task_") {
+                try? FileManager.default.removeItem(at: item)
             }
         }
     }
@@ -80,6 +91,11 @@ public struct WorktreeManager {
         let fullPath = root.appendingPathComponent(worktreeRel)
         if fs.fileExists(fullPath) {
             _ = try? shell.run("git worktree remove \(worktreeRel) --force", cwd: root)
+            // If the directory still exists after git cleanup (orphaned — not tracked by git worktree),
+            // remove it directly so `git worktree add` can succeed on the next attempt.
+            if fs.fileExists(fullPath) {
+                try? FileManager.default.removeItem(at: fullPath)
+            }
         }
         _ = try? shell.run("git branch -D \(branch)", cwd: root)
     }

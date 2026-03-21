@@ -15,7 +15,12 @@
       "Bash(for f:*)",
       "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/config.json | python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\('mayor:', d['models']['mayor']\\); print\\('tinker:', d['models']['tinker']\\)\")",
       "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_181423/run.json 2>/dev/null | python3 -m json.tool | head -30)",
-      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_181423/tasks/task_001.json | python3 -m json.tool)"
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260315_181423/tasks/task_001.json | python3 -m json.tool)",
+      "Bash(cat /Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260319_140906/tasks/task_002.json | python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\({'state':d['state'],'title':d['title'],'targetFiles':d['targetFiles'],'dependsOn':d['dependsOn']},indent=2\\)\\)\")",
+      "Bash(for run:*)",
+      "Bash(python3 -c \"import json; d=json.load\\(open\\('/Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260319_140906/tasks/task_004.json'\\)\\); print\\(json.dumps\\(d, indent=2\\)\\)\")",
+      "Bash(ls /Users/ktaniguchi/Development/todoagainagain/.tinkertown/task_001/ && git -C /Users/ktaniguchi/Development/todoagainagain worktree list 2>&1)",
+      "Bash(python3 << 'EOF'\nimport json, os\n\nrun_dir = \"/Users/ktaniguchi/Development/todoagainagain/.tinkertown/runs/run_20260319_140906\"\n\n# Fix run state to FAILED so UI shows it as done\nrun_path = f\"{run_dir}/run.json\"\nwith open\\(run_path\\) as f:\n    run = json.load\\(f\\)\nrun[\"state\"] = \"FAILED\"\nwith open\\(run_path, \"w\"\\) as f:\n    json.dump\\(run, f, indent=2\\)\n\n# Fix all tasks stuck in non-terminal states to FAILED\ntasks_dir = f\"{run_dir}/tasks\"\nfor fname in os.listdir\\(tasks_dir\\):\n    path = f\"{tasks_dir}/{fname}\"\n    with open\\(path\\) as f:\n        task = json.load\\(f\\)\n    if task[\"state\"] not in [\"MERGED\", \"CLEANED\", \"FAILED\", \"REJECTED\"]:\n        task[\"state\"] = \"FAILED\"\n        with open\\(path, \"w\"\\) as f:\n            json.dump\\(task, f, indent=2\\)\n        print\\(f\"Fixed {fname}: {task['state']} -> FAILED\"\\)\n\nprint\\(\"Done\"\\)\nEOF)"
     ]
   }
 }

@@ -171,6 +171,7 @@ public struct Orchestrator {
     public func generatePlan(request: String, pdr: PDRRecord, pdrResolvedURL: URL, skipApproval: Bool = false) throws -> String {
         let runID = makeRunID()
         try store.ensureRunDirectories(runID: runID)
+        try store.ensureDefaultAgents(maxParallelTasks: config.orchestrator.maxParallelTasks)
         let baseBranch = try GitDefaultBranch().detect(at: root)
         var runRecord = RunRecord(
             runID: runID,
@@ -207,7 +208,15 @@ public struct Orchestrator {
         for (index, planned) in plan.enumerated() {
             let taskID = String(format: "task_%03d", index + 1)
             let defaultCommand = inspector.selectCommand(config: config.verification, root: root)
-            let verificationCommand = planned.verificationCommand?.isEmpty == false ? planned.verificationCommand! : defaultCommand
+            // When the workspace has no recognized build system (mode=none / defaultCommand=="true"),
+            // skip any per-task verification commands the Mayor may have assigned.  They require test
+            // infrastructure that doesn't exist yet and would hang or fail immediately.
+            let verificationCommand: String
+            if defaultCommand == "true" {
+                verificationCommand = "true"
+            } else {
+                verificationCommand = planned.verificationCommand?.isEmpty == false ? planned.verificationCommand! : defaultCommand
+            }
             let created = TaskRecord(
                 taskID: taskID,
                 runID: runID,
@@ -219,6 +228,7 @@ public struct Orchestrator {
                 worktreePath: ".tinkertown/\(taskID)",
                 branch: "tinkertown/\(taskID)",
                 targetFiles: planned.targetFiles,
+                assignedAgentId: assignedTinkerAgentID(for: index),
                 maxRetries: config.orchestrator.maxRetriesPerTask,
                 verify: VerifyResult(command: verificationCommand)
             )
@@ -350,7 +360,20 @@ public struct Orchestrator {
     private func executeTask(_ task: TaskRecord, run: RunRecord) throws -> TaskOutcome {
         var task = task
         var taskResult = TaskOutcome()
-        let worktree = try worktrees.create(taskID: task.taskID, root: root, baseBranch: run.baseBranch)
+        let worktree: (path: String, branch: String)
+        do {
+            worktree = try worktrees.create(taskID: task.taskID, root: root, baseBranch: run.baseBranch)
+        } catch {
+            // Worktree creation failed (e.g. orphaned directory, git error). Fail the task so
+            // it is not re-selected in the next loop iteration — prevents infinite spin.
+            let message = "Worktree setup failed for \"\(task.title)\": \(error.localizedDescription)"
+            try? events.appendRawLog(runID: run.runID, taskID: task.taskID, attempt: 1, content: message)
+            logger?.log("ERROR", "[EXECUTE] \(message)")
+            try transitionTask(&task, to: .failed)
+            taskResult.failed = true
+            try store.saveTask(task)
+            return taskResult
+        }
         task.worktreePath = worktree.path
         task.branch = worktree.branch
         let worktreeURL = root.appendingPathComponent(task.worktreePath)
@@ -535,40 +558,118 @@ public struct Orchestrator {
         _ = try shell.run("git commit -m \"\(message)\"", cwd: worktreeURL)
     }
 
-    private func transitionRun(_ run: inout RunRecord, to newState: RunState, actorRole: String = "orchestrator") throws {
+    private func transitionRun(_ run: inout RunRecord, to newState: RunState, actorRole: String = "orchestrator", actorId: String? = nil) throws {
         try StateMachine.validateRunTransition(from: run.state, to: newState)
         let from = run.state
         run.state = newState
         run.updatedAt = Date()
         try store.saveRun(run)
-        try events.append(RunEvent(runID: run.runID, type: "RUN_STATE_CHANGED", from: from.rawValue, to: newState.rawValue, actorRole: actorRole))
+        let resolvedActorId = actorId ?? defaultAgentID(forRole: actorRole)
+        let agentState: AgentState
+        switch newState {
+        case .failed:
+            agentState = .blocked
+        case .completed, .cancelled:
+            agentState = .idle
+        default:
+            agentState = .busy
+        }
+        try syncAgent(agentID: resolvedActorId, role: agentRole(for: actorRole), state: agentState, runID: run.runID, taskID: nil, activity: "run \(newState.rawValue.lowercased())")
+        try events.append(RunEvent(runID: run.runID, type: "RUN_STATE_CHANGED", from: from.rawValue, to: newState.rawValue, actorRole: actorRole, actorId: resolvedActorId))
     }
 
     private func transitionTask(_ task: inout TaskRecord, to newState: TaskState) throws {
         try StateMachine.validateTaskTransition(from: task.state, to: newState)
         let from = task.state
         task.state = newState
-        let (role, activity) = actorRoleAndActivity(for: newState)
+        let (role, activity, actorId) = actorIdentity(for: task, state: newState)
         task.currentActorRole = role
+        task.currentActorId = actorId
         task.currentActivity = activity
         try store.saveTask(task)
-        try events.append(RunEvent(runID: task.runID, taskID: task.taskID, type: "TASK_STATE_CHANGED", from: from.rawValue, to: newState.rawValue, actorRole: role))
+        let agentState = agentState(for: newState)
+        try syncAgent(agentID: actorId, role: agentRole(for: role), state: agentState, runID: task.runID, taskID: task.taskID, activity: activity)
+        try events.append(RunEvent(runID: task.runID, taskID: task.taskID, type: "TASK_STATE_CHANGED", from: from.rawValue, to: newState.rawValue, actorRole: role, actorId: actorId))
     }
 
-    private func actorRoleAndActivity(for state: TaskState) -> (role: String, activity: String) {
+    private func actorIdentity(for task: TaskRecord, state: TaskState) -> (role: String, activity: String, actorId: String) {
         switch state {
-        case .taskCreated: return ("orchestrator", "created")
-        case .worktreeReady: return ("orchestrator", "worktree ready")
-        case .prompted: return ("worker", "working")
-        case .patchApplied: return ("worker", "patch applied")
-        case .verifying: return ("worker", "verifying")
-        case .verifyFailedRetryable: return ("worker", "retrying")
-        case .verifyPassed: return ("worker", "passed")
-        case .mergeReady: return ("orchestrator", "ready to merge")
-        case .merged: return ("orchestrator", "merged")
-        case .rejected: return ("orchestrator", "rejected")
-        case .failed: return ("orchestrator", "failed")
-        case .cleaned: return ("orchestrator", "cleaned")
+        case .taskCreated: return ("orchestrator", "created", "orchestrator_001")
+        case .worktreeReady: return ("orchestrator", "worktree ready", "orchestrator_001")
+        case .prompted: return ("worker", "working", task.assignedAgentId ?? "tinker_001")
+        case .patchApplied: return ("worker", "patch applied", task.assignedAgentId ?? "tinker_001")
+        case .verifying: return ("worker", "verifying", task.assignedAgentId ?? "tinker_001")
+        case .verifyFailedRetryable: return ("worker", "retrying", task.assignedAgentId ?? "tinker_001")
+        case .verifyPassed: return ("worker", "passed", task.assignedAgentId ?? "tinker_001")
+        case .mergeReady: return ("orchestrator", "ready to merge", "orchestrator_001")
+        case .merged: return ("orchestrator", "merged", "orchestrator_001")
+        case .rejected: return ("orchestrator", "rejected", "orchestrator_001")
+        case .failed: return ("orchestrator", "failed", "orchestrator_001")
+        case .cleaned: return ("orchestrator", "cleaned", "orchestrator_001")
+        }
+    }
+
+    private func assignedTinkerAgentID(for index: Int) -> String {
+        let slot = (index % max(1, config.orchestrator.maxParallelTasks)) + 1
+        return String(format: "tinker_%03d", slot)
+    }
+
+    private func defaultAgentID(forRole role: String) -> String {
+        switch role {
+        case "planner": return "mayor_001"
+        case "monitor": return "monitor_001"
+        case "operator": return "operator_001"
+        default: return "orchestrator_001"
+        }
+    }
+
+    private func agentRole(for role: String) -> AgentRole {
+        switch role {
+        case "planner": return .mayor
+        case "worker": return .tinker
+        case "monitor": return .monitor
+        case "operator": return .operatorRole
+        default: return .orchestrator
+        }
+    }
+
+    private func syncAgent(agentID: String, role: AgentRole, runID: String?, taskID: String?, activity: String) throws {
+        try syncAgent(agentID: agentID, role: role, state: .busy, runID: runID, taskID: taskID, activity: activity)
+    }
+
+    private func syncAgent(agentID: String, role: AgentRole, state: AgentState, runID: String?, taskID: String?, activity: String) throws {
+        let name: String
+        switch role {
+        case .mayor: name = "Mayor"
+        case .monitor: name = "Monitor"
+        case .operatorRole: name = "Operator"
+        case .orchestrator: name = "Orchestrator"
+        case .tinker:
+            if let suffix = agentID.split(separator: "_").last, let num = Int(suffix) {
+                name = "Tinker \(num)"
+            } else {
+                name = "Tinker"
+            }
+        }
+        try store.updateAgentActivity(
+            agentID: agentID,
+            name: name,
+            role: role,
+            state: state,
+            runID: runID,
+            taskID: taskID,
+            activity: activity
+        )
+    }
+
+    private func agentState(for state: TaskState) -> AgentState {
+        switch state {
+        case .failed, .rejected:
+            return .blocked
+        case .merged, .cleaned:
+            return .idle
+        default:
+            return .busy
         }
     }
 
